@@ -1,0 +1,10 @@
+.DS_Store
+*.pyc
+__pycache__/
+
+# Xcode user-specific state
+xcuserdata/
+*.xcuserstate
+
+# Temporary asset staging
+apps/visionos-client/Assets/Temp/
