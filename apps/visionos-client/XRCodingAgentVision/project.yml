@@ -1,0 +1,40 @@
+name: XRCodingAgentVision
+options:
+  deploymentTarget:
+    visionOS: "2.0"
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    PRODUCT_NAME: XRCodingAgentVision
+    PRODUCT_BUNDLE_IDENTIFIER: com.nousresearch.xrcodingagentvision
+    SWIFT_VERSION: 5.0
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: NO
+    INFOPLIST_FILE: ../App/Info.plist
+    LD_RUNPATH_SEARCH_PATHS:
+      - "$(inherited)"
+      - "@executable_path/Frameworks"
+      - "@executable_path/../../Frameworks"
+targets:
+  XRCodingAgentVision:
+    type: application
+    platform: visionOS
+    deploymentTarget: "2.0"
+    sources:
+      - path: ../App
+      - path: ../Assets
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_MODULE_NAME: XRCodingAgentVision
+schemes:
+  XRCodingAgentVision:
+    build:
+      targets:
+        XRCodingAgentVision: all
+    run:
+      config: Debug
+    archive:
+      config: Release

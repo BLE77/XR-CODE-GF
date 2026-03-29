@@ -1,0 +1,882 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XR Coding Agent Command Center</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23101416'/%3E%3Cpath d='M18 18h28v8H18zm0 14h28v8H18zm0 14h20v8H18z' fill='%2374d3a3'/%3E%3C/svg%3E" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #101416;
+        --panel: #182025;
+        --panel-soft: #1f2a31;
+        --text: #f4f7f5;
+        --muted: #97a8a0;
+        --accent: #74d3a3;
+        --accent-soft: rgba(116, 211, 163, 0.14);
+        --danger: #ff8877;
+        --warning: #f5c46b;
+        --border: rgba(255, 255, 255, 0.08);
+        --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+        --radius: 20px;
+        --mono: "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+        --sans: "SF Pro Display", "Avenir Next", ui-sans-serif, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        background:
+          radial-gradient(circle at top left, rgba(116, 211, 163, 0.16), transparent 28%),
+          radial-gradient(circle at top right, rgba(116, 188, 211, 0.12), transparent 24%),
+          linear-gradient(180deg, #12181b 0%, var(--bg) 55%);
+        color: var(--text);
+        min-height: 100vh;
+      }
+
+      .shell {
+        width: min(1440px, calc(100vw - 32px));
+        margin: 24px auto 40px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: 1.35fr 1fr;
+        gap: 18px;
+        margin-bottom: 18px;
+      }
+
+      .card {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.04), rgba(255, 255, 255, 0.02));
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(18px);
+      }
+
+      .hero-main {
+        padding: 24px;
+      }
+
+      .eyebrow,
+      .section-title,
+      .meta,
+      .empty,
+      .toast {
+        color: var(--muted);
+      }
+
+      .eyebrow {
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        margin-bottom: 10px;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: clamp(28px, 4vw, 44px);
+        line-height: 1;
+        margin-bottom: 12px;
+      }
+
+      .hero-copy {
+        font-size: 15px;
+        line-height: 1.55;
+        max-width: 66ch;
+        color: #d9e3dd;
+      }
+
+      .hero-stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        font-size: 13px;
+      }
+
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 0 6px rgba(116, 211, 163, 0.12);
+      }
+
+      .hero-side {
+        padding: 22px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      .hero-side .meta-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .meta-block {
+        padding: 14px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.035);
+        border: 1px solid var(--border);
+      }
+
+      .meta-label {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin-bottom: 8px;
+      }
+
+      .meta-value {
+        font-size: 15px;
+        line-height: 1.35;
+        word-break: break-word;
+      }
+
+      .hero-summary {
+        padding: 16px 18px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.035);
+        border: 1px solid var(--border);
+      }
+
+      .hero-summary strong {
+        display: block;
+        font-size: 17px;
+        margin-bottom: 8px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 18px;
+      }
+
+      .sidebar,
+      .main {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .panel {
+        padding: 18px;
+      }
+
+      .section-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 14px;
+      }
+
+      .section-title {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+      }
+
+      .project-list,
+      .session-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .project-card,
+      .session-card {
+        padding: 16px;
+        border-radius: 18px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+      }
+
+      .project-card.active,
+      .session-card.active {
+        border-color: rgba(116, 211, 163, 0.45);
+        box-shadow: inset 0 0 0 1px rgba(116, 211, 163, 0.2);
+      }
+
+      .project-name,
+      .session-title {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 6px;
+      }
+
+      .path,
+      .command,
+      .screen {
+        font-family: var(--mono);
+      }
+
+      .path,
+      .command {
+        font-size: 12px;
+        line-height: 1.45;
+        color: var(--muted);
+        word-break: break-word;
+      }
+
+      .project-actions,
+      .session-actions,
+      .composer-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      button,
+      textarea {
+        font: inherit;
+      }
+
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 14px;
+        cursor: pointer;
+        transition: transform 140ms ease, opacity 140ms ease, background 140ms ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .primary {
+        background: var(--accent);
+        color: #102017;
+        font-weight: 600;
+      }
+
+      .secondary {
+        background: rgba(255, 255, 255, 0.07);
+        color: var(--text);
+      }
+
+      .danger {
+        background: rgba(255, 136, 119, 0.14);
+        color: var(--danger);
+      }
+
+      .session-header {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+        align-items: start;
+      }
+
+      .badge {
+        padding: 7px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: rgba(255, 255, 255, 0.07);
+        white-space: nowrap;
+      }
+
+      .badge.running { color: var(--accent); }
+      .badge.starting { color: var(--warning); }
+      .badge.failed { color: var(--danger); }
+      .badge.finished { color: #9db7ff; }
+
+      .session-meta {
+        margin-top: 12px;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .meta-chip {
+        padding: 10px 12px;
+        border-radius: 14px;
+        background: var(--panel-soft);
+        font-size: 13px;
+        line-height: 1.4;
+      }
+
+      .screen {
+        margin-top: 14px;
+        min-height: 140px;
+        max-height: 280px;
+        overflow: auto;
+        background: #0b0f13;
+        border: 1px solid rgba(116, 211, 163, 0.18);
+        border-radius: 16px;
+        padding: 16px;
+        font-size: 12px;
+        line-height: 1.4;
+        white-space: pre;
+      }
+
+      .composer {
+        margin-top: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .manager-summary {
+        margin-top: 14px;
+        padding: 13px 14px;
+        border-radius: 16px;
+        background: rgba(116, 211, 163, 0.08);
+        border: 1px solid rgba(116, 211, 163, 0.12);
+        line-height: 1.5;
+      }
+
+      .decision-banner {
+        margin-top: 14px;
+        padding: 13px 14px;
+        border-radius: 16px;
+        background: rgba(245, 196, 107, 0.10);
+        border: 1px solid rgba(245, 196, 107, 0.16);
+        line-height: 1.5;
+      }
+
+      details.advanced {
+        margin-top: 14px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid var(--border);
+        padding: 0 14px 14px;
+      }
+
+      details.advanced > summary {
+        list-style: none;
+        cursor: pointer;
+        padding: 14px 0;
+        color: var(--muted);
+        font-size: 13px;
+        user-select: none;
+      }
+
+      details.advanced > summary::-webkit-details-marker {
+        display: none;
+      }
+
+      .diagnostics {
+        margin-top: 6px;
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 110px;
+        resize: vertical;
+        border-radius: 16px;
+        border: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.2);
+        color: var(--text);
+        padding: 14px;
+      }
+
+      .toast {
+        margin-top: 16px;
+        min-height: 22px;
+        font-size: 14px;
+      }
+
+      @media (max-width: 1100px) {
+        .hero,
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <section class="hero">
+        <div class="card hero-main">
+          <div class="eyebrow">XR Coding Agent</div>
+          <h1>Mac Command Center</h1>
+          <p class="hero-copy">
+            Keep one active project, Hermes supervisor, and your worker sessions in one calmer control plane.
+            The default view stays manager-first. Raw terminal controls and unsafe actions stay available, but only when you ask for them.
+          </p>
+          <div class="hero-stats">
+            <div class="pill"><span class="status-dot"></span><span id="bridge-status">Connecting to control bridge…</span></div>
+            <div class="pill">Current project: <strong id="current-project-pill">Loading…</strong></div>
+            <div class="pill">Open workers: <strong id="open-worker-count">0</strong></div>
+            <div class="pill">Pending decisions: <strong id="pending-decision-count">0</strong></div>
+            <div class="pill">Worker health: <strong id="worker-health-pill">Quiet</strong></div>
+          </div>
+        </div>
+
+        <aside class="card hero-side">
+          <div class="section-head">
+            <h2 class="section-title">Supervisor Snapshot</h2>
+            <button id="refresh-all" class="secondary">Refresh</button>
+          </div>
+          <div class="hero-summary">
+            <strong id="supervisor-summary">Waiting for Hermes to open a worker in the current project.</strong>
+            <div class="meta">Hermes will surface the next useful worker state here: active, waiting on you, blocked, or done.</div>
+          </div>
+          <div class="meta-grid">
+            <div class="meta-block">
+              <div class="meta-label">Saved Projects</div>
+              <div class="meta-value" id="project-count">0</div>
+            </div>
+            <div class="meta-block">
+              <div class="meta-label">Needs Review</div>
+              <div class="meta-value" id="needs-review-count">0</div>
+            </div>
+            <div class="meta-block">
+              <div class="meta-label">Blocked Workers</div>
+              <div class="meta-value" id="blocked-worker-count">0</div>
+            </div>
+            <div class="meta-block">
+              <div class="meta-label">Refreshed</div>
+              <div class="meta-value" id="last-refreshed">Waiting…</div>
+            </div>
+          </div>
+          <details class="advanced diagnostics">
+            <summary>Diagnostics</summary>
+            <div class="meta-grid">
+              <div class="meta-block">
+                <div class="meta-label">Command Center</div>
+                <div class="meta-value" id="command-center-url">Loading…</div>
+              </div>
+              <div class="meta-block">
+                <div class="meta-label">Control Bridge</div>
+                <div class="meta-value" id="control-bridge-address">Loading…</div>
+              </div>
+            </div>
+          </details>
+        </aside>
+      </section>
+
+      <section class="grid">
+        <aside class="sidebar">
+          <div class="card panel">
+            <div class="section-head">
+              <h2 class="section-title">Projects</h2>
+              <span class="meta">Choose the project first, then open the worker you need.</span>
+            </div>
+            <div id="project-list" class="project-list"></div>
+          </div>
+        </aside>
+
+        <main class="main">
+          <div class="card panel">
+            <div class="section-head">
+              <h2 class="section-title">Worker Control Plane</h2>
+              <span class="meta">Manager summary first. Raw controls stay tucked inside advanced panels.</span>
+            </div>
+            <div id="session-list" class="session-list"></div>
+            <div id="empty-state" class="empty">No managed sessions yet.</div>
+            <div id="toast" class="toast"></div>
+          </div>
+        </main>
+      </section>
+    </div>
+
+    <script>
+      const initialState = __BOOTSTRAP_JSON__;
+      let lastState = initialState;
+      let refreshTimer = null;
+      let lastSeenEventID = null;
+      const composerDrafts = new Map();
+
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      async function requestJSON(path, options = {}) {
+        const response = await fetch(path, {
+          ...options,
+          headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+          },
+        });
+        const payload = await response.json();
+        if (!response.ok || payload.ok === false) {
+          throw new Error(payload.error || response.statusText || "Request failed");
+        }
+        return payload;
+      }
+
+      function setToast(text, isError = false) {
+        const toast = document.getElementById("toast");
+        toast.textContent = text || "";
+        toast.style.color = isError ? "var(--danger)" : "var(--muted)";
+      }
+
+      function captureComposerDrafts() {
+        document.querySelectorAll("textarea[id^='composer-']").forEach((textarea) => {
+          const sessionID = textarea.id.replace("composer-", "");
+          composerDrafts.set(sessionID, textarea.value);
+        });
+      }
+
+      function renderProjects(state) {
+        const projectList = document.getElementById("project-list");
+        const currentProject = state.current_project || "";
+        const projects = state.projects || [];
+        document.getElementById("project-count").textContent = String(projects.length);
+        document.getElementById("current-project-pill").textContent = currentProject || "None";
+
+        projectList.innerHTML = projects.map((project) => {
+          const active = project.path === currentProject ? " active" : "";
+          return `
+            <section class="project-card${active}">
+              <div class="project-name">${escapeHtml(project.label || project.path)}</div>
+              <div class="path">${escapeHtml(project.path)}</div>
+              <div class="project-actions">
+                <button class="primary" data-action="open-session" data-tool="claude" data-path="${escapeHtml(project.path)}">Claude</button>
+                <button class="secondary" data-action="open-session" data-tool="codex" data-path="${escapeHtml(project.path)}">Codex</button>
+                <details class="advanced" style="width:100%;">
+                  <summary>Advanced project actions</summary>
+                  <div class="project-actions" style="margin-top:0;">
+                    <button class="secondary" data-action="open-session" data-tool="hermes" data-path="${escapeHtml(project.path)}">Hermes</button>
+                    <button class="danger" data-action="open-session" data-tool="claude" data-path="${escapeHtml(project.path)}" data-dangerous-skip="true">Claude Unsafe</button>
+                  </div>
+                </details>
+              </div>
+            </section>
+          `;
+        }).join("");
+      }
+
+      function sessionSortKey(session) {
+        const statusRank = session.status === "running" ? 0 : session.status === "starting" ? 1 : session.status === "failed" ? 3 : 2;
+        const pendingRank = session.waiting_on_user ? -1 : 0;
+        return `${pendingRank}:${statusRank}:${session.session_id || ""}`;
+      }
+
+      function renderSessionCardInner(session) {
+        const badgeClass = escapeHtml(session.status || "unknown");
+        const pendingQuestion = escapeHtml(session.pending_question || "");
+        const managerSummary = escapeHtml(session.manager_summary || session.status_text || "Waiting for activity");
+        const lastUpdate = escapeHtml(session.last_update || "");
+        const screenText = escapeHtml(session.screen_text || "No screen snapshot yet.");
+        const draftText = escapeHtml(composerDrafts.get(session.session_id) || "");
+        const taskTitle = escapeHtml(session.task_title || "Worker task");
+        const workerPhase = escapeHtml(session.worker_phase || session.status || "idle");
+        const blockedReason = escapeHtml(session.blocked_reason || "");
+        const isLive = ["starting", "running"].includes(session.status);
+        const statusLabel = session.waiting_on_user ? "Waiting on you" : escapeHtml(session.status_text || session.status || "idle");
+        return `
+          <div class="session-header">
+            <div>
+              <div class="session-title">${escapeHtml(session.worker_label || session.title || session.intent || session.session_id)}</div>
+              <div class="path">${escapeHtml(session.repo_path || "")}</div>
+            </div>
+            <div class="badge ${badgeClass}">${escapeHtml(session.status || "unknown")}</div>
+          </div>
+          <div class="session-meta">
+            <div class="meta-chip"><strong>Task</strong><br>${taskTitle}</div>
+            <div class="meta-chip"><strong>Phase</strong><br>${workerPhase}</div>
+            <div class="meta-chip"><strong>Status</strong><br>${statusLabel}</div>
+            <div class="meta-chip"><strong>Last update</strong><br>${lastUpdate || "Waiting for activity"}</div>
+          </div>
+          <div class="manager-summary">${managerSummary}</div>
+          ${pendingQuestion ? `<div class="decision-banner"><strong>Pending decision</strong><br>${pendingQuestion}</div>` : ""}
+          ${blockedReason ? `<div class="decision-banner"><strong>Blocked</strong><br>${blockedReason}</div>` : ""}
+          <pre class="screen">${screenText}</pre>
+          <details class="advanced">
+            <summary>Advanced worker controls</summary>
+            <div class="session-actions">
+              <button class="secondary" data-action="refresh-session" data-session-id="${escapeHtml(session.session_id)}">Refresh screen</button>
+              <button class="danger" data-action="close-session" data-session-id="${escapeHtml(session.session_id)}" ${isLive ? "" : "disabled"}>Close session</button>
+            </div>
+            <div class="composer">
+              <textarea id="composer-${escapeHtml(session.session_id)}" placeholder="Send a focused follow-up to this worker..." ${isLive ? "" : "disabled"}>${draftText}</textarea>
+              <div class="composer-actions">
+                <button class="primary" data-action="send-session" data-session-id="${escapeHtml(session.session_id)}" ${isLive ? "" : "disabled"}>Send to worker</button>
+              </div>
+            </div>
+          </details>
+        `;
+      }
+
+      function renderSessions(state) {
+        const list = document.getElementById("session-list");
+        const empty = document.getElementById("empty-state");
+        const sessions = [...(state.sessions || [])].sort((left, right) => sessionSortKey(left).localeCompare(sessionSortKey(right)));
+        const openSessions = sessions.filter((session) => ["starting", "running"].includes(session.status) && session.repo_path === state.current_project);
+        document.getElementById("open-worker-count").textContent = String(state.overview?.open_worker_count ?? openSessions.length);
+
+        if (sessions.length === 0) {
+          list.replaceChildren();
+          empty.style.display = "block";
+          return;
+        }
+
+        empty.style.display = "none";
+        const existing = new Map(
+          [...list.querySelectorAll(".session-card[data-session-id]")]
+            .map((node) => [node.getAttribute("data-session-id"), node])
+        );
+        const seen = new Set();
+        for (const session of sessions) {
+          if (!session.session_id) continue;
+          seen.add(session.session_id);
+          let card = existing.get(session.session_id);
+          let advancedOpen = false;
+          let hadFocus = false;
+          let selectionStart = null;
+          let selectionEnd = null;
+          if (!card) {
+            card = document.createElement("section");
+            card.className = "session-card";
+            card.dataset.sessionId = session.session_id;
+          } else {
+            const advanced = card.querySelector("details.advanced");
+            advancedOpen = Boolean(advanced?.open);
+            const composer = card.querySelector(`textarea[id='composer-${session.session_id}']`);
+            hadFocus = composer === document.activeElement;
+            if (hadFocus) {
+              selectionStart = composer.selectionStart;
+              selectionEnd = composer.selectionEnd;
+            }
+          }
+          card.className = `session-card ${["starting", "running"].includes(session.status) ? "active" : ""}`.trim();
+          card.innerHTML = renderSessionCardInner(session);
+          const advanced = card.querySelector("details.advanced");
+          if (advanced) {
+            advanced.open = advancedOpen;
+          }
+          if (hadFocus) {
+            const composer = card.querySelector(`textarea[id='composer-${session.session_id}']`);
+            if (composer) {
+              composer.focus();
+              if (selectionStart !== null && selectionEnd !== null) {
+                composer.setSelectionRange(selectionStart, selectionEnd);
+              }
+            }
+          }
+          list.appendChild(card);
+        }
+        for (const [sessionID, node] of existing.entries()) {
+          if (!seen.has(sessionID)) {
+            node.remove();
+          }
+        }
+      }
+
+      function renderState(state) {
+        captureComposerDrafts();
+        lastState = state;
+        renderProjects(state);
+        renderSessions(state);
+        document.getElementById("bridge-status").textContent = state.bridge_status || "Unknown";
+        document.getElementById("pending-decision-count").textContent = String(state.overview?.pending_decision_count ?? 0);
+        document.getElementById("needs-review-count").textContent = String(state.overview?.needs_review_count ?? 0);
+        document.getElementById("blocked-worker-count").textContent = String(state.overview?.blocked_worker_count ?? 0);
+        document.getElementById("worker-health-pill").textContent = state.overview?.health || "Unknown";
+        document.getElementById("supervisor-summary").textContent = state.overview?.supervisor_summary || "Waiting for Hermes to open a worker in the current project.";
+        document.getElementById("control-bridge-address").textContent = state.control_bridge_address || "Unknown";
+        document.getElementById("command-center-url").textContent = state.command_center_url || window.location.href;
+        document.getElementById("last-refreshed").textContent = state.generated_at || new Date().toLocaleTimeString();
+      }
+
+      async function refreshState() {
+        try {
+          const payload = await requestJSON("/api/state");
+          renderState(payload);
+          setToast("Synced with the Mac companion.");
+        } catch (error) {
+          setToast(error.message, true);
+        }
+      }
+
+      function scheduleRefresh(delay = 150) {
+        if (refreshTimer !== null) {
+          clearTimeout(refreshTimer);
+        }
+        refreshTimer = setTimeout(() => {
+          refreshTimer = null;
+          refreshState();
+        }, delay);
+      }
+
+      function shouldRefreshForEvent(event) {
+        const type = event.type || "";
+        return [
+          "terminal.started",
+          "terminal.output",
+          "terminal.screen",
+          "terminal.input",
+          "terminal.finished",
+          "terminal.failed",
+          "worker.updated",
+          "worker.pending_question",
+          "hermes.status",
+          "project.selected",
+        ].includes(type);
+      }
+
+      function eventID(event) {
+        return `${event.ts || ""}-${event.type || ""}-${event.session_id || "none"}`;
+      }
+
+      async function pollRecentEvents() {
+        try {
+          const payload = await requestJSON("/api/events?limit=24");
+          const events = Array.isArray(payload.events) ? payload.events : [];
+          if (events.length === 0) {
+            return;
+          }
+          const newestID = eventID(events[events.length - 1]);
+          if (lastSeenEventID === null) {
+            lastSeenEventID = newestID;
+            setToast("Live updates connected.");
+            return;
+          }
+          if (newestID !== lastSeenEventID) {
+            lastSeenEventID = newestID;
+            if (events.some((event) => shouldRefreshForEvent(event))) {
+              scheduleRefresh(120);
+            }
+          }
+        } catch (_error) {
+        }
+      }
+
+      async function handleOpenSession(tool, repoPath, dangerouslySkipPermissions = false) {
+        if (dangerouslySkipPermissions) {
+          const confirmed = window.confirm("Open Claude with dangerously skipped permissions in this project?");
+          if (!confirmed) {
+            return;
+          }
+        }
+        const payload = await requestJSON("/api/open", {
+          method: "POST",
+          body: JSON.stringify({
+            tool,
+            repo_path: repoPath,
+            reuse_existing: true,
+            dangerously_skip_permissions: dangerouslySkipPermissions,
+          }),
+        });
+        renderState(payload.state);
+        setToast(`${tool}${dangerouslySkipPermissions ? " (unsafe)" : ""} is ready in ${repoPath}.`);
+      }
+
+      async function handleCloseSession(sessionID) {
+        const payload = await requestJSON("/api/close", {
+          method: "POST",
+          body: JSON.stringify({ session_id: sessionID }),
+        });
+        renderState(payload.state);
+        setToast(`Closed ${sessionID}.`);
+      }
+
+      async function handleRefreshSession(sessionID) {
+        const payload = await requestJSON("/api/read", {
+          method: "POST",
+          body: JSON.stringify({ session_id: sessionID }),
+        });
+        renderState(payload.state);
+        setToast(`Refreshed ${sessionID}.`);
+      }
+
+      async function handleSendSession(sessionID) {
+        const composer = document.getElementById(`composer-${sessionID}`);
+        const text = composer.value.trim();
+        if (!text) {
+          setToast("Type a message before sending it.", true);
+          return;
+        }
+        const payload = await requestJSON("/api/send", {
+          method: "POST",
+          body: JSON.stringify({ session_id: sessionID, text }),
+        });
+        composerDrafts.set(sessionID, "");
+        composer.value = "";
+        renderState(payload.state);
+        setToast(`Sent to ${sessionID}.`);
+      }
+
+      document.addEventListener("input", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLTextAreaElement)) return;
+        if (!target.id.startsWith("composer-")) return;
+        const sessionID = target.id.replace("composer-", "");
+        composerDrafts.set(sessionID, target.value);
+      });
+
+      document.addEventListener("click", async (event) => {
+        const target = event.target.closest("button[data-action]");
+        if (!target) return;
+        const action = target.dataset.action;
+        try {
+          if (action === "open-session") {
+            await handleOpenSession(
+              target.dataset.tool,
+              target.dataset.path,
+              target.dataset.dangerousSkip === "true",
+            );
+          } else if (action === "close-session") {
+            await handleCloseSession(target.dataset.sessionId);
+          } else if (action === "refresh-session") {
+            await handleRefreshSession(target.dataset.sessionId);
+          } else if (action === "send-session") {
+            await handleSendSession(target.dataset.sessionId);
+          }
+        } catch (error) {
+          setToast(error.message, true);
+        }
+      });
+
+      document.getElementById("refresh-all").addEventListener("click", refreshState);
+      renderState(initialState);
+      pollRecentEvents();
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "visible") {
+          scheduleRefresh(100);
+          pollRecentEvents();
+        }
+      });
+      setInterval(() => {
+        if (document.visibilityState === "visible") {
+          pollRecentEvents();
+        }
+      }, 1500);
+      setInterval(() => {
+        if (document.visibilityState === "visible") {
+          refreshState();
+        }
+      }, 20000);
+    </script>
+  </body>
+</html>

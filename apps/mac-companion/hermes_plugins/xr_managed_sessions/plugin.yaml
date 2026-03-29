@@ -1,0 +1,8 @@
+name: xr_managed_sessions
+version: 1.0.0
+description: XR Coding Agent managed session control for Claude Code, Codex, and Hermes CLI
+requires_env:
+  - XR_AGENT_CONTROL_HOST
+  - XR_AGENT_CONTROL_PORT
+provides_tools:
+  - xr_managed_session

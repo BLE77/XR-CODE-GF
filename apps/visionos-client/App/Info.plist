@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>XR Coding Agent listens for voice commands you want to send to Hermes on your Mac.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>XR Coding Agent connects to the Mac companion on your local network so Hermes can send events and receive commands.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>XR Coding Agent transcribes your spoken coding commands so Hermes can act on them.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<key>NSWorldSensingUsageDescription</key>
+	<string>XR Coding Agent uses world sensing to understand room geometry so the avatar can stay grounded and avoid furniture in your space.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+    </dict>
+    <key>UIApplicationSupportsIndirectInputEvents</key>
+    <true/>
+</dict>
+</plist>

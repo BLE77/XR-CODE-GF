@@ -1,0 +1,410 @@
+:root {
+  color-scheme: dark;
+  font-family: "SF Pro Display", "Segoe UI", sans-serif;
+  background:
+    radial-gradient(circle at top, rgba(111, 208, 255, 0.16), transparent 34%),
+    radial-gradient(circle at bottom right, rgba(88, 255, 184, 0.12), transparent 28%),
+    linear-gradient(180deg, #07131f 0%, #0b1a29 42%, #091019 100%);
+  color: #eff7fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: transparent;
+  color: #eff7fb;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+}
+
+input,
+textarea {
+  width: 100%;
+  border-radius: 18px;
+  border: 1px solid rgba(180, 224, 255, 0.16);
+  background: rgba(9, 21, 33, 0.82);
+  color: #eff7fb;
+  padding: 0.9rem 1rem;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 6.5rem;
+}
+
+.app-shell {
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 2.5rem;
+}
+
+.hero-panel,
+.panel {
+  background: rgba(7, 17, 27, 0.72);
+  border: 1px solid rgba(180, 224, 255, 0.12);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(20px);
+}
+
+.hero-panel {
+  border-radius: 32px;
+  padding: 1.5rem;
+  margin-bottom: 1.25rem;
+  display: grid;
+  gap: 1.25rem;
+}
+
+.hero-panel h1,
+.panel h2 {
+  margin: 0;
+  line-height: 1.05;
+}
+
+.hero-panel h1 {
+  font-size: clamp(2rem, 4vw, 3.4rem);
+  max-width: 10ch;
+}
+
+.hero-copy {
+  max-width: 64ch;
+  color: rgba(239, 247, 251, 0.78);
+  font-size: 1.02rem;
+}
+
+.hero-stats {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.stat-card,
+.summary-card,
+.decision-card,
+.supervisor-banner,
+.quiet-banner,
+.empty-state,
+.feed-item,
+.worker-card,
+.secondary-surface {
+  border-radius: 24px;
+  background: rgba(12, 28, 43, 0.7);
+  border: 1px solid rgba(180, 224, 255, 0.1);
+}
+
+.stat-card {
+  padding: 1rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.stat-card strong {
+  font-size: 1.7rem;
+}
+
+.stat-label,
+.eyebrow,
+.meta-label,
+.summary-title,
+.banner-label {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.73rem;
+  color: rgba(185, 220, 245, 0.7);
+}
+
+.layout-grid {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: 1.15fr 0.95fr 1.2fr;
+  align-items: start;
+}
+
+.panel {
+  border-radius: 30px;
+  padding: 1.25rem;
+}
+
+.stack-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.detail-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+}
+
+.panel-header.compact h2 {
+  font-size: 1.2rem;
+}
+
+.panel-meta {
+  color: rgba(239, 247, 251, 0.62);
+  font-size: 0.95rem;
+  max-width: 18ch;
+  text-align: right;
+}
+
+.field-grid,
+.button-row,
+.chip-row,
+.detail-meta,
+.worker-list,
+.feed-list {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.field-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.field span {
+  color: rgba(239, 247, 251, 0.82);
+  font-size: 0.92rem;
+}
+
+.button-row {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+}
+
+.primary-button,
+.secondary-button,
+.chip-button,
+.worker-card {
+  transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.primary-button,
+.secondary-button,
+.chip-button {
+  min-height: 3.2rem;
+  border-radius: 18px;
+  padding: 0.8rem 1rem;
+  font-weight: 600;
+}
+
+.primary-button {
+  background: linear-gradient(135deg, #4ce2b4, #37aaf7);
+  color: #06283d;
+}
+
+.secondary-button,
+.chip-button {
+  background: rgba(19, 39, 57, 0.86);
+  color: #eff7fb;
+  border: 1px solid rgba(180, 224, 255, 0.14);
+}
+
+.chip-row {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.summary-card,
+.decision-card,
+.supervisor-banner,
+.quiet-banner,
+.empty-state,
+.secondary-surface {
+  padding: 1rem;
+}
+
+.summary-body,
+.worker-summary,
+.feed-item p,
+.decision-card p,
+.quiet-banner,
+.empty-state,
+.detail-note {
+  margin: 0;
+  color: rgba(239, 247, 251, 0.82);
+  line-height: 1.5;
+}
+
+.supervisor-banner {
+  display: grid;
+  gap: 0.45rem;
+  background: linear-gradient(180deg, rgba(255, 177, 76, 0.18), rgba(12, 28, 43, 0.72));
+}
+
+.worker-card {
+  width: 100%;
+  text-align: left;
+  padding: 1rem;
+  display: grid;
+  gap: 0.8rem;
+}
+
+.worker-card.selected {
+  border-color: rgba(92, 214, 255, 0.52);
+  background: rgba(16, 40, 59, 0.9);
+}
+
+.worker-card-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.worker-card strong,
+.detail-meta strong {
+  display: block;
+  font-size: 1.06rem;
+}
+
+.worker-card p,
+.detail-meta {
+  margin: 0;
+}
+
+.detail-meta {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.feed-item {
+  padding: 0.9rem 1rem;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.feed-item-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.8rem;
+  align-items: center;
+}
+
+.feed-item time {
+  color: rgba(185, 220, 245, 0.7);
+  font-size: 0.82rem;
+}
+
+.phase-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.25rem;
+  border-radius: 999px;
+  padding: 0.45rem 0.85rem;
+  font-weight: 700;
+  font-size: 0.88rem;
+  white-space: nowrap;
+}
+
+.tone-calm {
+  background: rgba(114, 203, 255, 0.16);
+  color: #8bd8ff;
+}
+
+.tone-working {
+  background: rgba(88, 255, 184, 0.14);
+  color: #72f0c5;
+}
+
+.tone-attention {
+  background: rgba(255, 184, 93, 0.16);
+  color: #ffc169;
+}
+
+.tone-success {
+  background: rgba(153, 255, 169, 0.18);
+  color: #98f0a1;
+}
+
+.secondary-surface summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.terminal-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: center;
+  color: rgba(185, 220, 245, 0.72);
+  font-size: 0.85rem;
+}
+
+.terminal-surface {
+  min-height: 380px;
+  max-height: 68vh;
+  overflow: auto;
+  border-radius: 24px;
+  border: 1px solid rgba(180, 224, 255, 0.12);
+  background: linear-gradient(180deg, rgba(4, 11, 18, 0.98), rgba(8, 16, 25, 0.98));
+  padding: 1rem;
+}
+
+.terminal-surface pre {
+  margin: 0;
+  color: #a5ffca;
+  font-size: 0.92rem;
+  line-height: 1.45;
+  font-family: "SF Mono", "Menlo", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.primary-button:hover,
+.secondary-button:hover,
+.chip-button:hover,
+.worker-card:hover {
+  transform: translateY(-1px);
+}
+
+@media (max-width: 1240px) {
+  .layout-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .terminal-surface {
+    max-height: 36rem;
+  }
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding: 1rem 0.8rem 1.4rem;
+  }
+
+  .hero-panel,
+  .panel {
+    border-radius: 24px;
+    padding: 1rem;
+  }
+
+  .field-grid,
+  .detail-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-panel h1 {
+    max-width: none;
+  }
+}

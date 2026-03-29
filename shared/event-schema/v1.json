@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "XR Coding Agent Event",
+  "type": "object",
+  "required": ["type", "ts", "payload"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "avatar.listening",
+        "avatar.thinking",
+        "avatar.speaking",
+        "speech.transcript",
+        "session.started",
+        "session.output",
+        "session.finished",
+        "session.failed",
+        "agent.summary"
+      ]
+    },
+    "ts": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}
