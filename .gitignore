@@ -1,6 +1,8 @@
 .DS_Store
 *.pyc
 __pycache__/
+node_modules/
+dist/
 
 # Xcode user-specific state
 xcuserdata/
@@ -8,3 +10,11 @@ xcuserdata/
 
 # Temporary asset staging
 apps/visionos-client/Assets/Temp/
+
+# Local environment secrets
+.env.local
+apps/mac-companion/.env.local
+
+# Local Quest browser/dev artifacts
+apps/metaquest-client/.certs/
+apps/metaquest-client/.smoke-preview/

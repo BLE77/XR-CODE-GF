@@ -59,6 +59,20 @@ def test_what_happened_emits_assistant_reply(tmp_path) -> None:
     assert "assistant.reply" in event_types
 
 
+def test_coding_session_sync_emits_ack_even_when_no_sessions_exist(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    app.handle_client_message({"type": "coding_sessions.sync", "payload": {}})
+
+    events = app.events.recent_serialized()
+
+    assert any(
+        event["type"] == "coding_sessions.synced"
+        and event["payload"] == {"session_count": 0, "live_count": 0, "complete": True}
+        for event in events
+    )
+
+
 def test_project_picker_message_emits_selected_project_and_status(tmp_path, monkeypatch) -> None:
     app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
     chosen_path = str(tmp_path / "picked-repo")

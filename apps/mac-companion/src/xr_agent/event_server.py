@@ -157,14 +157,13 @@ class EventServer:
             replay_events = [event for event in self._events if event.event_type != "session.output"]
         sender_task: asyncio.Task[None] | None = None
         try:
-            for event in replay_events:
-                try:
-                    await websocket.send(json.dumps(self.serialize_event(event)))
-                except ConnectionClosed:
-                    return
             sender_task = asyncio.create_task(self._send_queue_messages(websocket, queue))
+            for event in replay_events:
+                self._enqueue_message(queue, json.dumps(self.serialize_event(event)))
             async for raw_message in websocket:
-                self._handle_client_message(raw_message)
+                # Keep the websocket loop responsive even when the app handler does
+                # heavier work like launching or routing coding sessions.
+                await asyncio.to_thread(self._handle_client_message, raw_message)
         except ConnectionClosed:
             pass
         finally:

@@ -105,7 +105,10 @@ class XRAgentApp:
         target_repo_path = self._resolve_requested_repo_path(repo_path) or str(self.config.default_repo_path)
         transcript = self.speech.transcribe(text)
         target_repo_path, transcript = self._resolve_repo_path_from_transcript(target_repo_path, transcript)
+        previous_repo_path = str(self.config.default_repo_path)
         self._set_current_repo_focus(target_repo_path)
+        if target_repo_path != previous_repo_path:
+            self.events.publish(make_event("project.selected", None, {"path": target_repo_path}))
         explicit_worker_reply = self._handle_explicit_worker_instruction(transcript, repo_path=target_repo_path)
         if explicit_worker_reply is not None:
             return explicit_worker_reply
@@ -329,6 +332,7 @@ class XRAgentApp:
                 )
                 return
 
+            self._set_current_repo_focus(selected_path)
             self.events.publish(
                 make_event(
                     "project.selected",
@@ -336,7 +340,6 @@ class XRAgentApp:
                     {"path": selected_path},
                 )
             )
-            self._set_current_repo_focus(selected_path)
             self.events.publish(
                 make_event(
                     "hermes.status",
@@ -676,11 +679,44 @@ class XRAgentApp:
         names = ", ".join(f"{session.title} ({session.session_id})" for session in active)
         return f"Still running: {names}"
 
+    def _speech_timing_payload(self, text: str, explicit_duration_ms: int | None = None) -> dict[str, Any]:
+        if explicit_duration_ms is not None and explicit_duration_ms > 0:
+            return {"duration_ms": max(800, explicit_duration_ms)}
+        normalized = text.strip()
+        if not normalized:
+            return {"duration_ms": 2200}
+        duration_ms = max(2200, min(9000, len(normalized) * 58))
+        return {"duration_ms": duration_ms}
+
+    def _speech_payload(self, text: str) -> tuple[str, dict[str, Any]]:
+        synthesis = self.speech.synthesize(text)
+        spoken = synthesis.text
+        payload: dict[str, Any] = {
+            "text": spoken,
+            **self._speech_timing_payload(spoken, synthesis.duration_ms),
+        }
+        if synthesis.audio_base64:
+            payload["audio_base64"] = synthesis.audio_base64
+            payload["audio_mime_type"] = synthesis.audio_mime_type or "audio/mpeg"
+        if synthesis.alignment:
+            payload["alignment"] = synthesis.alignment
+        if synthesis.normalized_alignment:
+            payload["normalized_alignment"] = synthesis.normalized_alignment
+        if synthesis.provider != "plain":
+            payload["voice_provider"] = synthesis.provider
+        if synthesis.voice_id:
+            payload["voice_id"] = synthesis.voice_id
+        if synthesis.voice_name:
+            payload["voice_name"] = synthesis.voice_name
+        if synthesis.model_id:
+            payload["voice_model_id"] = synthesis.model_id
+        return spoken, payload
+
     def _respond(self, text: str) -> dict[str, Any]:
-        spoken = self.speech.speak(text)
-        self.events.publish(make_event("avatar.speaking", None, {"text": spoken}))
-        self.events.publish(make_event("assistant.reply", None, {"text": spoken}))
-        self.events.publish(make_event("agent.summary", None, {"text": spoken}))
+        spoken, payload = self._speech_payload(text)
+        self.events.publish(make_event("avatar.speaking", None, payload))
+        self.events.publish(make_event("assistant.reply", None, payload))
+        self.events.publish(make_event("agent.summary", None, payload))
         return {"message": spoken}
 
     def _authoritative_coding_session_route(self, transcript: str) -> RoutedCommand | None:
@@ -810,14 +846,20 @@ class XRAgentApp:
         )
 
     def _publish_coding_session_reply(self, session: ManagedCodingSession, text: str) -> str:
-        spoken = self.speech.speak(text)
+        spoken, speech_payload = self._speech_payload(text)
         payload = {
-            "text": spoken,
             "title": session.title,
             "intent": session.intent,
             "repo_path": session.repo_path,
+            **speech_payload,
         }
-        self.events.publish(make_event("avatar.speaking", session.session_id, {"text": spoken}))
+        self.events.publish(
+            make_event(
+                "avatar.speaking",
+                session.session_id,
+                speech_payload,
+            )
+        )
         self.events.publish(make_event("assistant.reply", session.session_id, payload))
         self.events.publish(make_event("agent.summary", session.session_id, payload))
         return spoken
@@ -1220,21 +1262,27 @@ class XRAgentApp:
         return session
 
     def _publish_coding_session_snapshot(self) -> None:
-        for session in reversed(self.coding_sessions.list_sessions()):
-            self.events.publish(
-                make_event(
-                    "terminal.started",
-                    session.session_id,
-                    {
-                        "title": session.title,
-                        "repo_path": session.repo_path,
-                        "command": session.command,
-                        "pid": session.pid,
-                        "log_path": session.log_path,
-                        **self._worker_event_payload(session),
-                    },
-                )
+        sessions = self.coding_sessions.list_sessions()
+        for session in reversed(sessions):
+            event_type = (
+                "terminal.finished"
+                if session.status == SessionStatus.FINISHED and session.exit_code == 0
+                else "terminal.failed"
+                if session.status == SessionStatus.FINISHED
+                else "terminal.started"
             )
+            payload = {
+                "title": session.title,
+                "repo_path": session.repo_path,
+                "command": session.command,
+                "pid": session.pid,
+                "log_path": session.log_path,
+                **self._worker_event_payload(session),
+            }
+            if event_type != "terminal.started":
+                payload["exit_code"] = session.exit_code
+                payload["summary"] = session.summary or f"{session.title} exited."
+            self.events.publish(make_event(event_type, session.session_id, payload))
             if session.screen_text is not None:
                 self.events.publish(
                     make_event(
@@ -1266,6 +1314,17 @@ class XRAgentApp:
                         },
                     )
                 )
+        self.events.publish(
+            make_event(
+                "coding_sessions.synced",
+                None,
+                {
+                    "session_count": len(sessions),
+                    "live_count": sum(1 for session in sessions if session.status == SessionStatus.RUNNING),
+                    "complete": True,
+                },
+            )
+        )
 
     def _summarize_coding_session(self, target: str | None, *, repo_path: str | None = None) -> dict[str, Any]:
         if target is None:
@@ -1824,12 +1883,13 @@ class XRAgentApp:
             manager_summary=manager_summary,
             last_update=f"User replied: {transcript.strip()}",
         )
+        _, speech_payload = self._speech_payload(reply)
         self.events.publish(
             make_event(
                 "hermes.status",
                 session.session_id,
                 {
-                    "text": reply,
+                    **speech_payload,
                     "worker_label": state.worker_label,
                     "repo_path": session.repo_path,
                     "title": session.title,
@@ -1837,8 +1897,9 @@ class XRAgentApp:
                 },
             )
         )
-        self.events.publish(make_event("assistant.reply", session.session_id, {"text": reply}))
-        self.events.publish(make_event("agent.summary", session.session_id, {"text": reply}))
+        reply_payload = speech_payload
+        self.events.publish(make_event("assistant.reply", session.session_id, reply_payload))
+        self.events.publish(make_event("agent.summary", session.session_id, reply_payload))
         return True
 
     def _resolve_pending_worker_after_direct_input(self, session_id: str, text: str) -> None:
@@ -2262,8 +2323,9 @@ class XRAgentApp:
                 },
             )
         )
-        self.events.publish(make_event("assistant.reply", updated.session_id, {"text": summary}))
-        self.events.publish(make_event("agent.summary", updated.session_id, {"text": summary}))
+        _, summary_payload = self._speech_payload(summary)
+        self.events.publish(make_event("assistant.reply", updated.session_id, summary_payload))
+        self.events.publish(make_event("agent.summary", updated.session_id, summary_payload))
 
     def _user_facing_summary(self, session: Session) -> str:
         if self.hermes.is_hermes_command(session.command):
@@ -2594,10 +2656,22 @@ def build_app(config: AppConfig | None = None) -> XRAgentApp:
     config = config or AppConfig()
     config.state_dir.mkdir(parents=True, exist_ok=True)
     auto_open_debug_log_terminal = os.environ.get("XR_AGENT_OPEN_DEBUG_TAILS", "0") == "1"
+    speech_timeout = 20.0
+    try:
+        speech_timeout = max(3.0, float(os.environ.get("ELEVENLABS_TIMEOUT_SECONDS", "20")))
+    except ValueError:
+        speech_timeout = 20.0
     store = SessionStore(state_path=config.state_dir / "sessions.json")
     runner = SessionRunner(store, max_output_tail_lines=config.max_output_tail_lines)
     router = CommandRouter()
-    speech = SpeechService()
+    speech = SpeechService(
+        api_key=os.environ.get("ELEVENLABS_API_KEY"),
+        voice_id=os.environ.get("ELEVENLABS_VOICE_ID"),
+        voice_name=os.environ.get("ELEVENLABS_VOICE_NAME"),
+        model_id=os.environ.get("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
+        output_format=os.environ.get("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+        timeout_seconds=speech_timeout,
+    )
     summarizer = Summarizer()
     hermes = HermesAdapter(
         hermes_cmd=config.hermes_cmd,

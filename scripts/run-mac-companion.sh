@@ -12,6 +12,19 @@ LISTENER_PID=""
 export PYTHONPATH="$APP_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 export XR_AGENT_OPEN_DEBUG_TAILS
 
+load_local_env() {
+  local env_file
+  for env_file in "$ROOT_DIR/.env.local" "$APP_DIR/.env.local"; do
+    if [[ -f "$env_file" ]]; then
+      set -a
+      source "$env_file"
+      set +a
+    fi
+  done
+}
+
+load_local_env
+
 looks_like_project_root() {
   local candidate="$1"
   [[ -d "$candidate" ]] || return 1
@@ -45,7 +58,7 @@ default_repo_path() {
 }
 
 existing_listener() {
-  lsof -tiTCP:"$EVENT_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1
+  { lsof -tiTCP:"$EVENT_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1; } || true
 }
 
 stop_existing_companion() {

@@ -18,6 +18,7 @@ Hermes is the core agent brain:
 apps/
   mac-companion/      Mac-side runner, Hermes adapter, event bus
   metaquest-client/   Quest Browser MVP client on the same backend/control plane
+  metaquest-native/   Native Quest Unity/OpenXR client scaffold
   visionos-client/    Vision Pro spatial client
 docs/                 MVP notes and implementation plan
 shared/
@@ -40,6 +41,7 @@ shared/
 - `docs/MVP.md`
 - `docs/EXECUTION_PLAN.md`
 - `docs/ANIMATION_PIPELINE.md`
+- `docs/METAQUEST_NATIVE_PLAN.md`
 
 ## Next Build Step
 

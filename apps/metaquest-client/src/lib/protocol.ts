@@ -43,6 +43,8 @@ export interface CodingSessionSnapshot {
 }
 
 export interface ConnectionSettings {
+  url?: string;
+  scheme?: "ws" | "wss";
   host: string;
   port: number;
 }

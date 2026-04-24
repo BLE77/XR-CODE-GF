@@ -1508,6 +1508,51 @@ def test_client_message_can_close_coding_session_directly(tmp_path) -> None:
     app.coding_sessions.shutdown()
 
 
+def test_respond_includes_backend_voice_payload_when_available(tmp_path) -> None:
+    class FakeSpeech:
+        def transcribe(self, text: str) -> str:
+            return text
+
+        def speak(self, text: str) -> str:
+            return text
+
+        def synthesize(self, text: str):
+            from xr_agent.speech_service import SpeechSynthesisResult
+
+            return SpeechSynthesisResult(
+                text=text,
+                duration_ms=1337,
+                audio_base64="ZmFrZQ==",
+                audio_mime_type="audio/mpeg",
+                normalized_alignment={
+                    "characters": ["h", "i"],
+                    "character_start_times_seconds": [0.0, 0.1],
+                    "character_end_times_seconds": [0.1, 0.2],
+                },
+                provider="elevenlabs",
+                voice_id="voice-123",
+                voice_name="Yuki",
+                model_id="eleven_flash_v2_5",
+            )
+
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    app.speech = FakeSpeech()
+
+    response = app.handle_text("what happened?", repo_path=str(tmp_path))
+
+    assert response["message"] == "No session has completed yet."
+    assistant_reply = next(
+        event for event in app.events.recent_serialized() if event["type"] == "assistant.reply"
+    )
+    payload = assistant_reply["payload"]
+    assert payload["audio_base64"] == "ZmFrZQ=="
+    assert payload["audio_mime_type"] == "audio/mpeg"
+    assert payload["duration_ms"] == 1337
+    assert payload["voice_provider"] == "elevenlabs"
+    assert payload["voice_name"] == "Yuki"
+    assert payload["voice_model_id"] == "eleven_flash_v2_5"
+
+
 def _wait_for_coding_session(app, intent: str, timeout: float = 5):
     deadline = time.time() + timeout
     while time.time() < deadline:

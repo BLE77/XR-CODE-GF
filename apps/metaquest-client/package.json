@@ -6,16 +6,22 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke:preview": "node scripts/smoke-preview.mjs"
   },
   "dependencies": {
+    "@iwsdk/core": "^0.3.1",
+    "@pixiv/three-vrm": "^3.4.5",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "three": "^0.182.0"
   },
   "devDependencies": {
+    "@iwsdk/vite-plugin-dev": "^0.3.1",
     "@types/node": "^24.6.1",
     "@types/react": "^19.1.2",
     "@types/react-dom": "^19.1.2",
+    "@types/three": "^0.182.0",
     "@vitejs/plugin-react": "^5.0.4",
     "typescript": "^5.9.3",
     "vite": "^7.1.10"

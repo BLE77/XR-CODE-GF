@@ -1,0 +1,24 @@
+# Unity-generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# IDE and platform noise
+.DS_Store
+.idea/
+.vscode/
+
+# Android and build outputs
+*.apk
+*.aab
+*.obb
+
+# Unity meta files should stay for assets, but not generated caches
+*.pidb
+*.suo
+*.tmp
+

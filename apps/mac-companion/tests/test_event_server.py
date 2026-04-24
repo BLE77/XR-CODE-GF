@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 
 import websockets
 
@@ -166,3 +167,38 @@ def test_event_server_routes_client_messages_to_handler() -> None:
             "payload": {"text": "run tests", "repo_path": "/tmp/demo"},
         }
     ]
+
+
+def test_slow_client_handler_does_not_block_event_delivery() -> None:
+    server = EventServer()
+
+    def slow_handler(_: dict[str, object]) -> None:
+        time.sleep(0.35)
+
+    server.set_message_handler(slow_handler)
+    server.start_in_background("127.0.0.1", 0)
+    port = server.bound_port
+    assert port is not None
+
+    async def scenario() -> None:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            await websocket.send(json.dumps({"type": "voice.command", "payload": {"text": "run tests"}}))
+
+            def publish_from_worker() -> None:
+                time.sleep(0.05)
+                server.publish(make_event("agent.summary", None, {"text": "still responsive"}))
+
+            worker = threading.Thread(target=publish_from_worker)
+            worker.start()
+            try:
+                live = json.loads(await asyncio.wait_for(websocket.recv(), timeout=0.2))
+            finally:
+                worker.join(timeout=1)
+
+            assert live["type"] == "agent.summary"
+            assert live["payload"] == {"text": "still responsive"}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.stop_in_background()
