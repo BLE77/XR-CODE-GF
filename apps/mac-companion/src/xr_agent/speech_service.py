@@ -5,6 +5,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,6 +33,8 @@ class SpeechService:
         voice_name: str | None = None,
         model_id: str = "eleven_flash_v2_5",
         output_format: str = "mp3_44100_128",
+        stt_api_key: str | None = None,
+        stt_model_id: str = "scribe_v2",
         timeout_seconds: float = 20.0,
     ) -> None:
         self.api_key = api_key.strip() if api_key else None
@@ -39,6 +42,8 @@ class SpeechService:
         self.voice_name = voice_name.strip() if voice_name else None
         self.model_id = model_id.strip() if model_id else "eleven_flash_v2_5"
         self.output_format = output_format.strip() if output_format else "mp3_44100_128"
+        self.stt_api_key = stt_api_key.strip() if stt_api_key else self.api_key
+        self.stt_model_id = stt_model_id.strip() if stt_model_id else "scribe_v2"
         self.timeout_seconds = max(3.0, timeout_seconds)
         self._resolved_voice: tuple[str | None, str | None] | None = None
         self._warned_messages: set[str] = set()
@@ -48,6 +53,33 @@ class SpeechService:
 
     def speak(self, text: str) -> str:
         return self.synthesize(text).text
+
+    def transcribe_audio(self, audio: bytes, *, mime_type: str | None = None) -> str:
+        if not audio:
+            return ""
+        if not self.stt_api_key:
+            raise RuntimeError("Speech-to-text is not configured. Set ELEVENLABS_API_KEY.")
+
+        response = self._request_multipart_json(
+            "POST",
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            fields=[
+                ("model_id", self.stt_model_id),
+                ("tag_audio_events", "false"),
+                ("diarize", "false"),
+            ],
+            file_field=(
+                "file",
+                self._filename_for_mime_type(mime_type),
+                mime_type or "audio/webm",
+                audio,
+            ),
+            api_key=self.stt_api_key,
+        )
+        transcript = response.get("text")
+        if not isinstance(transcript, str):
+            raise RuntimeError("Speech-to-text returned no transcript.")
+        return transcript.strip()
 
     def synthesize(self, text: str) -> SpeechSynthesisResult:
         spoken = text.strip() or text
@@ -165,6 +197,86 @@ class SpeechService:
             raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(str(exc.reason)) from exc
+
+    def _request_multipart_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        fields: list[tuple[str, str]],
+        file_field: tuple[str, str, str, bytes],
+        api_key: str,
+    ) -> dict[str, Any]:
+        boundary = f"xr-agent-{uuid.uuid4().hex}"
+        body = self._encode_multipart_form(boundary, fields, file_field)
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "xi-api-key": api_key,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(str(exc.reason)) from exc
+
+    def _encode_multipart_form(
+        self,
+        boundary: str,
+        fields: list[tuple[str, str]],
+        file_field: tuple[str, str, str, bytes],
+    ) -> bytes:
+        chunks: list[bytes] = []
+        for name, value in fields:
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode("utf-8"),
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                    str(value).encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+
+        file_name, filename, content_type, content = file_field
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{file_name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("utf-8"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                content,
+                b"\r\n",
+                f"--{boundary}--\r\n".encode("utf-8"),
+            ]
+        )
+        return b"".join(chunks)
+
+    def _filename_for_mime_type(self, mime_type: str | None) -> str:
+        normalized = (mime_type or "").split(";", 1)[0].strip().lower()
+        extensions = {
+            "audio/aac": ".aac",
+            "audio/mp4": ".m4a",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/ogg": ".ogg",
+            "audio/opus": ".opus",
+            "audio/wav": ".wav",
+            "audio/webm": ".webm",
+            "audio/x-m4a": ".m4a",
+            "audio/x-wav": ".wav",
+            "video/webm": ".webm",
+        }
+        return f"quest-mic{extensions.get(normalized, '.webm')}"
 
     def _coerce_alignment(self, payload: Any) -> dict[str, list[Any]] | None:
         if not isinstance(payload, dict):

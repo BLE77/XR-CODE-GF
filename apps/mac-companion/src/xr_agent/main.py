@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -73,6 +76,15 @@ class XRAgentApp:
         self._workers_by_session_id: dict[str, WorkerSupervisorState] = {}
         self._pending_decisions_by_session_id: dict[str, PendingDecisionRecord] = {}
         self._project_states_by_repo_path: dict[str, ProjectSupervisorState] = {}
+        self._last_screen_publish_by_session_id: dict[str, float] = {}
+        self._speech_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xr-agent-speech")
+        try:
+            self._speech_timeout_seconds = max(
+                0.05,
+                float(os.environ.get("XR_AGENT_SPEECH_INLINE_TIMEOUT_SECONDS", "0.45")),
+            )
+        except ValueError:
+            self._speech_timeout_seconds = 0.45
         self._command_center: CommandCenterServer | None = None
         self._command_center_url: str | None = None
 
@@ -95,6 +107,7 @@ class XRAgentApp:
         self.hermes_runtime.stop()
         self.events.stop_in_background()
         self.control.stop_in_background()
+        self._speech_executor.shutdown(wait=False, cancel_futures=True)
         self._restore_hermes_session_control_environment()
 
     @property
@@ -133,6 +146,8 @@ class XRAgentApp:
         if routed.intent == "list_coding_sessions":
             return self._respond(self.coding_sessions.summarize_open_sessions())
         if routed.intent in {"open_codex", "open_claude_code", "open_hermes_cli"}:
+            if self._looks_like_worker_launch_with_task(transcript) and self._can_delegate_session_management_to_hermes():
+                return self._start_supervised_followup(target_repo_path, transcript)
             return self._launch_coding_session(routed.intent, target_repo_path, routed.raw_text)
         if routed.intent == "close_coding_session":
             return self._close_coding_session(routed.target, repo_path=target_repo_path)
@@ -191,6 +206,105 @@ class XRAgentApp:
                         "agent.summary",
                         None,
                         {"text": f"Failed to process voice command: {exc}"},
+                    )
+                )
+            return
+
+        if message_type == "voice.audio":
+            audio_base64 = payload.get("audio_base64")
+            mime_type = payload.get("mime_type")
+            repo_path = payload.get("repo_path")
+
+            if not isinstance(audio_base64, str) or not audio_base64.strip():
+                self.events.publish(
+                    make_event(
+                        "agent.summary",
+                        None,
+                        {"text": "I did not receive usable microphone audio."},
+                    )
+                )
+                return
+
+            try:
+                audio_bytes = base64.b64decode(audio_base64, validate=True)
+            except (binascii.Error, ValueError):
+                self.events.publish(
+                    make_event(
+                        "agent.summary",
+                        None,
+                        {"text": "I could not read the microphone audio from the headset."},
+                    )
+                )
+                return
+
+            if not audio_bytes:
+                self.events.publish(
+                    make_event(
+                        "agent.summary",
+                        None,
+                        {"text": "I did not receive usable microphone audio."},
+                    )
+                )
+                return
+
+            voice_started_at = time.perf_counter()
+            self.events.publish(
+                make_event(
+                    "hermes.status",
+                    None,
+                    {
+                        "text": f"Mic audio received ({max(1, len(audio_bytes) // 1024)} KB). Transcribing now.",
+                        "phase": "voice.transcribing",
+                        "elapsed_ms": 0,
+                    },
+                )
+            )
+            try:
+                transcript = self.speech.transcribe_audio(
+                    audio_bytes,
+                    mime_type=mime_type if isinstance(mime_type, str) else None,
+                )
+                transcribe_ms = int((time.perf_counter() - voice_started_at) * 1000)
+                if not transcript:
+                    self.events.publish(
+                        make_event(
+                            "agent.summary",
+                            None,
+                            {"text": "I could not hear a command in that microphone audio."},
+                        )
+                    )
+                    return
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": f"Transcript ready in {transcribe_ms} ms. Asking Hermes now.",
+                            "phase": "voice.transcribed",
+                            "elapsed_ms": transcribe_ms,
+                        },
+                    )
+                )
+                self.handle_text(transcript, repo_path=repo_path if isinstance(repo_path, str) else None)
+                total_ms = int((time.perf_counter() - voice_started_at) * 1000)
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": f"Voice turn routed in {total_ms} ms.",
+                            "phase": "voice.complete",
+                            "elapsed_ms": total_ms,
+                            "transcribe_ms": transcribe_ms,
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive path
+                self.events.publish(
+                    make_event(
+                        "agent.summary",
+                        None,
+                        {"text": f"Microphone transcription failed: {exc}"},
                     )
                 )
             return
@@ -430,6 +544,8 @@ class XRAgentApp:
                         "",
                         requested_dangerous_skip=bool(request.get("dangerously_skip_permissions")),
                     )
+                else:
+                    self._publish_coding_session_snapshot()
                 return {
                     "ok": True,
                     "action": normalized_action,
@@ -458,6 +574,8 @@ class XRAgentApp:
 
             if normalized_action == "read_session_screen":
                 current = self.coding_sessions.get(session.session_id) or session
+                if current.screen_text is not None:
+                    self._on_coding_session_screen(current)
                 return {
                     "ok": True,
                     "action": normalized_action,
@@ -631,7 +749,7 @@ class XRAgentApp:
             on_finished=self._on_session_finished,
         )
         return {
-            "message": self.speech.speak(f"Started {title.lower()} in {repo_path}."),
+            "message": f"Started {title.lower()} in {repo_path}.",
             "session_id": session.session_id,
             "intent": title,
         }
@@ -689,7 +807,24 @@ class XRAgentApp:
         return {"duration_ms": duration_ms}
 
     def _speech_payload(self, text: str) -> tuple[str, dict[str, Any]]:
-        synthesis = self.speech.synthesize(text)
+        future = self._speech_executor.submit(self.speech.synthesize, text)
+        try:
+            synthesis = future.result(timeout=self._speech_timeout_seconds)
+        except FutureTimeoutError:
+            future.cancel()
+            spoken = text.strip() or text
+            return spoken, {
+                "text": spoken,
+                **self._speech_timing_payload(spoken),
+                "voice_provider": "browser-fallback",
+            }
+        except Exception:
+            spoken = text.strip() or text
+            return spoken, {
+                "text": spoken,
+                **self._speech_timing_payload(spoken),
+                "voice_provider": "browser-fallback",
+            }
         spoken = synthesis.text
         payload: dict[str, Any] = {
             "text": spoken,
@@ -933,6 +1068,23 @@ class XRAgentApp:
     def _can_delegate_session_management_to_hermes(self) -> bool:
         return Path(self.hermes.hermes_cmd).name == "hermes" and self.control.bound_port is not None
 
+    def _looks_like_worker_launch_with_task(self, transcript: str) -> bool:
+        lowered = transcript.lower()
+        if not re.search(r"\b(?:claude|cloud|quad code|codex|hermes)\b", lowered):
+            return False
+        if not re.search(r"\b(?:open|start|launch|spin up|boot up)\b", lowered):
+            return False
+
+        task_phrases = (
+            r"\b(?:and|then)\s+(?:have\s+it\s+|ask\s+it\s+to\s+|tell\s+it\s+to\s+|tell\s+\w+\s+to\s+)?"
+            r"(?:fix|inspect|check|build|run|test|debug|implement|make|create|update|refactor|look|review|"
+            r"continue|work|start|do)\b",
+            r"\b(?:to|so\s+it\s+can)\s+"
+            r"(?:fix|inspect|check|build|run|test|debug|implement|make|create|update|refactor|look|review|"
+            r"continue|work|start|do)\b",
+        )
+        return any(re.search(pattern, lowered) for pattern in task_phrases)
+
     def _latest_open_coding_session(
         self,
         intent: str,
@@ -982,6 +1134,7 @@ class XRAgentApp:
                 "Use only repo paths that already appear in the snapshot or the current focus repo. Never invent or scan for new paths.",
                 "Use send_to_session only when a suitable session already exists.",
                 "Prefer short truthful reply_text values that describe the action you chose.",
+                "For hands-free XR coding in the trusted current repo, when opening Claude Code to inspect, edit, test, or run code, set dangerously_skip_permissions to true unless the user explicitly asks for approval prompts.",
                 "",
                 "JSON schema:",
                 schema,
@@ -1268,7 +1421,7 @@ class XRAgentApp:
                 "terminal.finished"
                 if session.status == SessionStatus.FINISHED and session.exit_code == 0
                 else "terminal.failed"
-                if session.status == SessionStatus.FINISHED
+                if session.status in {SessionStatus.FINISHED, SessionStatus.FAILED}
                 else "terminal.started"
             )
             payload = {
@@ -1378,6 +1531,7 @@ class XRAgentApp:
         return self._respond(reply)
 
     def _write_to_coding_session(self, session_id: str, text: str) -> None:
+        self.coding_sessions.wait_until_ready_for_input(session_id)
         session = self.coding_sessions.send_input(session_id, text)
         self.events.publish(
             make_event(
@@ -2074,11 +2228,27 @@ class XRAgentApp:
                 cleaned_transcript = re.sub(r"\s+", " ", cleaned_transcript).strip(" ,.-")
                 return resolved_path, cleaned_transcript or transcript
 
-        named_project_path = self._resolve_named_project_path(transcript, default_repo_path)
-        if named_project_path is not None:
-            return named_project_path, transcript
+        if self._transcript_may_reference_named_project(transcript):
+            named_project_path = self._resolve_named_project_path(transcript, default_repo_path)
+            if named_project_path is not None:
+                return named_project_path, transcript
 
         return default_repo_path, transcript
+
+    def _transcript_may_reference_named_project(self, transcript: str) -> bool:
+        normalized = self._normalize_project_phrase(transcript)
+        if not normalized:
+            return False
+        return any(
+            marker in normalized
+            for marker in (
+                " project",
+                " repo",
+                " repository",
+                " folder",
+                " workspace",
+            )
+        )
 
     def _extract_spoken_repo_path(self, transcript: str) -> str | None:
         patterns = [
@@ -2403,6 +2573,11 @@ class XRAgentApp:
         )
 
     def _on_coding_session_screen(self, session: ManagedCodingSession) -> None:
+        now = time.monotonic()
+        last_published = self._last_screen_publish_by_session_id.get(session.session_id, 0.0)
+        if now - last_published < 0.35:
+            return
+        self._last_screen_publish_by_session_id[session.session_id] = now
         self.events.publish(
             make_event(
                 "terminal.screen",
@@ -2622,6 +2797,19 @@ class XRAgentApp:
             summary=reply,
         )
         self.store.update(session)
+        self.events.publish(
+            make_event(
+                "session.finished",
+                session.session_id,
+                {
+                    "title": session.title,
+                    "repo_path": session.repo_path,
+                    "command": session.command,
+                    "summary": reply,
+                    "exit_code": 0,
+                },
+            )
+        )
 
     def _record_hermes_failure(
         self,
@@ -2645,6 +2833,19 @@ class XRAgentApp:
             summary=summary,
         )
         self.store.update(session)
+        self.events.publish(
+            make_event(
+                "session.failed",
+                session.session_id,
+                {
+                    "title": session.title,
+                    "repo_path": session.repo_path,
+                    "command": session.command,
+                    "summary": summary,
+                    "exit_code": 1,
+                },
+            )
+        )
 
     def _hermes_command_label(self, prompt: str, transport: str) -> str:
         if transport == "acp":
@@ -2670,6 +2871,8 @@ def build_app(config: AppConfig | None = None) -> XRAgentApp:
         voice_name=os.environ.get("ELEVENLABS_VOICE_NAME"),
         model_id=os.environ.get("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
         output_format=os.environ.get("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+        stt_api_key=os.environ.get("ELEVENLABS_STT_API_KEY") or os.environ.get("ELEVENLABS_API_KEY"),
+        stt_model_id=os.environ.get("ELEVENLABS_STT_MODEL_ID", "scribe_v2"),
         timeout_seconds=speech_timeout,
     )
     summarizer = Summarizer()

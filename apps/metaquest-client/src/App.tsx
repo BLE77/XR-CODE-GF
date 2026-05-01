@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useQuestClient } from "./lib/useQuestClient";
 import {
   formatEventTime,
@@ -26,7 +26,44 @@ type StoredSettings = {
   repoPath: string;
 };
 
+type WorkerOpenTool = "claude" | "codex" | "hermes";
+type WorkerOpenOptions = {
+  dangerouslySkipPermissions?: boolean;
+};
+type BrowserSpeechRecognition = InstanceType<NonNullable<Window["SpeechRecognition"]>>;
+
 const DEFAULT_SCHEME: StoredSettings["scheme"] = window.location.protocol === "https:" ? "wss" : "ws";
+
+function canCaptureMicrophone(): boolean {
+  return Boolean(navigator.mediaDevices?.getUserMedia) && typeof MediaRecorder !== "undefined";
+}
+
+function preferredVoiceMimeType(): string {
+  if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
+    return "";
+  }
+  return (
+    [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4",
+      "audio/ogg;codecs=opus",
+    ].find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? ""
+  );
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read microphone audio."));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
 
 function loadSettings(): StoredSettings {
   try {
@@ -157,6 +194,16 @@ export default function App() {
   const lastSpokenReplyIdRef = useRef("");
   const activeUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const activeMediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const activeMediaStreamRef = useRef<MediaStream | null>(null);
+  const mediaRecorderChunksRef = useRef<BlobPart[]>([]);
+  const pendingHermesCommandRef = useRef<{ text: string; repoPath?: string } | null>(null);
+  const pendingVoiceAudioRef = useRef<{ audioBase64: string; mimeType: string; repoPath?: string } | null>(null);
+  const pendingWorkerOpenRef = useRef<
+    { tool: WorkerOpenTool; repoPath: string; dangerouslySkipPermissions?: boolean } | null
+  >(null);
+  const autoBridgeConnectRef = useRef(false);
 
   const detailSession =
     client.sessions.find((session) => session.sessionId === selectedWorkerId) ??
@@ -210,11 +257,28 @@ export default function App() {
       : "Use direct mode when Quest Browser needs to talk straight to the Mac companion. On headset, localhost points at the headset, not your Mac.";
   const connectionWarning = !BRIDGE_ENABLED && connectionMode === "bridge"
     ? "Bridge mode is disabled in this build because this page host is not guaranteed to proxy /xr-agent-events. Use direct mode unless you explicitly enable bridge support."
-    : directModeUsesLoopback
+    : connectionMode === "direct" && directModeUsesLoopback
     ? "Direct mode is still pointing at localhost. On Quest that means the headset itself, so switch host to your Mac LAN IP."
     : directModeMixedContentRisk
       ? "This page is running over HTTPS while direct mode is set to ws. Browsers can block mixed-content sockets. Use bridge mode or switch direct mode to wss."
       : client.connectionState.lastError;
+  const compactConnectionStatus = client.isConnected
+    ? "Connected"
+    : client.connectionState.mode === "connecting"
+      ? "Connecting"
+      : client.connectionState.mode === "error"
+        ? "Bridge issue"
+        : "Disconnected";
+  const miniConnectionStatus = client.isConnected
+    ? "Online"
+    : client.connectionState.mode === "connecting"
+      ? "Linking"
+      : client.connectionState.mode === "error"
+        ? "Issue"
+        : "Offline";
+  const connectionDetail = client.isConnected
+    ? client.statusText
+    : connectionWarning ?? client.statusText;
   const mostUsefulAction =
     client.pendingSession
       ? {
@@ -223,8 +287,8 @@ export default function App() {
         }
       : client.liveSessions.length === 0
         ? {
-            label: "Open Claude Here",
-            action: () => sendSuggestedPrompt("Open Claude here"),
+            label: "Open Claude Full Access",
+            action: () => openWorkerSession("claude", { dangerouslySkipPermissions: true }),
           }
         : {
             label: "Focus Active Worker",
@@ -234,16 +298,16 @@ export default function App() {
     client.liveSessions.length === 0
       ? {
           label: "Open Codex Here",
-          action: () => sendSuggestedPrompt("Open Codex here"),
+          action: () => openWorkerSession("codex"),
         }
       : {
           label: "What Needs Me Next?",
-          action: () => sendSuggestedPrompt("Summarize the active workers and tell me what needs attention."),
+          action: () => sendSuggestedPrompt("What needs me next across the active workers?"),
         };
 
   useEffect(() => {
     const recognizerClass = window.SpeechRecognition ?? window.webkitSpeechRecognition;
-    setVoiceAvailable(Boolean(recognizerClass));
+    setVoiceAvailable(Boolean(recognizerClass) || canCaptureMicrophone());
   }, []);
 
   useEffect(() => {
@@ -284,7 +348,31 @@ export default function App() {
       activeAudioRef.current?.pause();
       activeAudioRef.current = null;
       activeUtteranceRef.current = null;
+      try {
+        activeRecognitionRef.current?.stop();
+      } catch {
+        // Browser speech engines can throw if stop lands after an implicit end.
+      }
+      activeRecognitionRef.current = null;
+      const recorder = activeMediaRecorderRef.current;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onerror = null;
+        recorder.onstop = null;
+        try {
+          if (recorder.state !== "inactive") {
+            recorder.stop();
+          }
+        } catch {
+          // MediaRecorder can throw if the track ended first.
+        }
+      }
+      activeMediaRecorderRef.current = null;
+      mediaRecorderChunksRef.current = [];
+      activeMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      activeMediaStreamRef.current = null;
       setSpeechSpeaking(false);
+      setIsListening(false);
       window.speechSynthesis?.cancel();
     };
   }, []);
@@ -413,6 +501,50 @@ export default function App() {
     };
   }, [speechSpeaking]);
 
+  useEffect(() => {
+    if (autoBridgeConnectRef.current || connectionMode !== "bridge" || !BRIDGE_ENABLED) {
+      return;
+    }
+    if (client.isConnected || client.connectionState.mode !== "idle") {
+      return;
+    }
+    autoBridgeConnectRef.current = true;
+    window.setTimeout(() => {
+      connect();
+    }, 150);
+  }, [client.connectionState.mode, client.isConnected, connectionMode]);
+
+  useEffect(() => {
+    if (!client.isConnected || !pendingHermesCommandRef.current) {
+      return;
+    }
+    const pendingCommand = pendingHermesCommandRef.current;
+    pendingHermesCommandRef.current = null;
+    if (client.sendHermesCommand(pendingCommand.text, pendingCommand.repoPath)) {
+      setHermesPrompt("");
+    }
+  }, [client.isConnected]);
+
+  useEffect(() => {
+    if (!client.isConnected || !pendingVoiceAudioRef.current) {
+      return;
+    }
+    const pendingAudio = pendingVoiceAudioRef.current;
+    pendingVoiceAudioRef.current = null;
+    client.sendVoiceAudio(pendingAudio.audioBase64, pendingAudio.mimeType, pendingAudio.repoPath);
+  }, [client.isConnected]);
+
+  useEffect(() => {
+    if (!client.isConnected || !pendingWorkerOpenRef.current) {
+      return;
+    }
+    const pendingOpen = pendingWorkerOpenRef.current;
+    pendingWorkerOpenRef.current = null;
+    client.openCodingSession(pendingOpen.tool, pendingOpen.repoPath, {
+      dangerouslySkipPermissions: pendingOpen.dangerouslySkipPermissions,
+    });
+  }, [client.isConnected]);
+
   function connect() {
     if (connectionMode === "bridge" && !BRIDGE_ENABLED) {
       client.noteStatus("Bridge mode is disabled in this build. Switch to direct and enter your Mac host.");
@@ -448,19 +580,54 @@ export default function App() {
     setSelectedWorkerId(sessionId);
   }
 
+  function currentRepoPath(): string {
+    return repoPath.trim() || client.selectedProjectPath || ".";
+  }
+
+  function openWorkerSession(tool: WorkerOpenTool, options: WorkerOpenOptions = {}) {
+    const targetRepoPath = currentRepoPath();
+    if (!client.isConnected) {
+      pendingWorkerOpenRef.current = {
+        tool,
+        repoPath: targetRepoPath,
+        dangerouslySkipPermissions: options.dangerouslySkipPermissions,
+      };
+      client.noteStatus("Connecting to Hermes, then opening the worker.");
+      connect();
+      return;
+    }
+    client.openCodingSession(tool, targetRepoPath, {
+      dangerouslySkipPermissions: options.dangerouslySkipPermissions,
+    });
+  }
+
   function sendHermesPrompt() {
     const trimmed = hermesPrompt.trim();
     if (!trimmed) {
       return;
     }
-    if (client.sendHermesCommand(trimmed, repoPath.trim() || undefined)) {
+    const targetRepoPath = repoPath.trim() || undefined;
+    if (!client.isConnected) {
+      pendingHermesCommandRef.current = { text: trimmed, repoPath: targetRepoPath };
+      client.noteStatus("Connecting to Hermes, then sending your command.");
+      connect();
+      return;
+    }
+    if (client.sendHermesCommand(trimmed, targetRepoPath)) {
       setHermesPrompt("");
     }
   }
 
   function sendSuggestedPrompt(prompt: string) {
     setHermesPrompt(prompt);
-    client.sendHermesCommand(prompt, repoPath.trim() || undefined);
+    const targetRepoPath = repoPath.trim() || undefined;
+    if (!client.isConnected) {
+      pendingHermesCommandRef.current = { text: prompt, repoPath: targetRepoPath };
+      client.noteStatus("Connecting to Hermes, then sending your command.");
+      connect();
+      return;
+    }
+    client.sendHermesCommand(prompt, targetRepoPath);
   }
 
   function sendWorkerReply(routeViaManager: boolean) {
@@ -489,61 +656,346 @@ export default function App() {
     }
   }
 
+  function submitVoiceCommand(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    setHermesPrompt(trimmed);
+    const targetRepoPath = repoPath.trim() || undefined;
+    if (!client.isConnected) {
+      pendingHermesCommandRef.current = { text: trimmed, repoPath: targetRepoPath };
+      client.noteStatus("Connecting to Hermes, then sending your voice command.");
+      connect();
+      return;
+    }
+    client.sendHermesCommand(trimmed, targetRepoPath);
+  }
+
+  function stopVoicePrompt() {
+    const recognition = activeRecognitionRef.current;
+    activeRecognitionRef.current = null;
+    if (recognition) {
+      setIsListening(false);
+      try {
+        recognition.stop();
+      } catch {
+        // Browser speech engines can throw if stop lands after an implicit end.
+      }
+      return;
+    }
+
+    const recorder = activeMediaRecorderRef.current;
+    if (recorder) {
+      client.noteStatus("Sending microphone audio to Hermes...");
+      try {
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+      } catch {
+        activeMediaRecorderRef.current = null;
+        setIsListening(false);
+        client.noteStatus("Could not stop microphone recording.");
+      }
+    }
+  }
+
+  function clearRecordedVoicePrompt() {
+    activeMediaRecorderRef.current = null;
+    mediaRecorderChunksRef.current = [];
+    activeMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    activeMediaStreamRef.current = null;
+    setIsListening(false);
+  }
+
+  async function sendRecordedVoicePrompt(mimeType: string) {
+    const chunks = mediaRecorderChunksRef.current;
+    const fallbackMimeType = mimeType || "audio/webm";
+    activeMediaRecorderRef.current = null;
+    activeMediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    activeMediaStreamRef.current = null;
+    mediaRecorderChunksRef.current = [];
+    setIsListening(false);
+
+    if (!chunks.length) {
+      client.noteStatus("I did not receive audio from the microphone.");
+      return;
+    }
+
+    const blob = new Blob(chunks, { type: fallbackMimeType });
+    if (blob.size < 128) {
+      client.noteStatus("I did not receive enough microphone audio.");
+      return;
+    }
+
+    try {
+      const audioBase64 = await blobToBase64(blob);
+      const targetRepoPath = repoPath.trim() || undefined;
+      const payload = {
+        audioBase64,
+        mimeType: blob.type || fallbackMimeType,
+        repoPath: targetRepoPath,
+      };
+      if (!client.isConnected) {
+        pendingVoiceAudioRef.current = payload;
+        client.noteStatus("Connecting to Hermes, then sending your mic recording.");
+        connect();
+        return;
+      }
+      client.sendVoiceAudio(payload.audioBase64, payload.mimeType, payload.repoPath);
+    } catch (error) {
+      client.noteStatus(
+        error instanceof Error
+          ? `Could not send microphone audio: ${error.message}`
+          : "Could not send microphone audio.",
+      );
+    }
+  }
+
+  async function startRecordedVoicePrompt() {
+    if (!canCaptureMicrophone()) {
+      client.noteStatus("Microphone capture needs the secure HTTPS Quest URL.");
+      return;
+    }
+    if (activeMediaRecorderRef.current) {
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      const requestedMimeType = preferredVoiceMimeType();
+      const recorder = new MediaRecorder(
+        stream,
+        requestedMimeType ? { mimeType: requestedMimeType } : undefined,
+      );
+      mediaRecorderChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          mediaRecorderChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onerror = () => {
+        clearRecordedVoicePrompt();
+        client.noteStatus("Microphone recording failed.");
+      };
+      recorder.onstop = () => {
+        void sendRecordedVoicePrompt(recorder.mimeType || requestedMimeType || "audio/webm");
+      };
+      activeMediaStreamRef.current = stream;
+      activeMediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsListening(true);
+      client.noteStatus("Mic is recording. Tap again to send.");
+    } catch (error) {
+      clearRecordedVoicePrompt();
+      client.noteStatus(
+        error instanceof Error
+          ? `Could not start microphone capture: ${error.message}`
+          : "Could not start microphone capture.",
+      );
+    }
+  }
+
   function startVoicePrompt() {
     const recognizerClass = window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!recognizerClass) {
+      void startRecordedVoicePrompt();
+      return;
+    }
+    if (activeRecognitionRef.current) {
       return;
     }
     const recognition = new recognizerClass();
     recognition.lang = "en-US";
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = false;
     recognition.onresult = (event) => {
       const nextText = Array.from(event.results)
+        .slice(event.resultIndex ?? 0)
         .map((result) => result[0]?.transcript ?? "")
         .join(" ")
         .trim();
       if (nextText) {
-        setHermesPrompt(nextText);
-        client.sendHermesCommand(nextText, repoPath.trim() || undefined);
+        submitVoiceCommand(nextText);
       }
     };
     recognition.onerror = () => {
       setIsListening(false);
+      activeRecognitionRef.current = null;
     };
     recognition.onend = () => {
       setIsListening(false);
+      activeRecognitionRef.current = null;
     };
+    activeRecognitionRef.current = recognition;
     setIsListening(true);
-    recognition.start();
+    try {
+      recognition.start();
+    } catch (error) {
+      activeRecognitionRef.current = null;
+      setIsListening(false);
+      client.noteStatus(
+        error instanceof Error
+          ? `Could not start microphone recognition: ${error.message}`
+          : "Could not start microphone recognition.",
+      );
+    }
+  }
+
+  function toggleVoicePrompt() {
+    if (isListening || activeRecognitionRef.current || activeMediaRecorderRef.current) {
+      stopVoicePrompt();
+      return;
+    }
+    startVoicePrompt();
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero-panel">
-        <div className="hero-grid">
+    <main className="app-shell control-deck">
+      <section className="deck-panel deck-header">
+        <div className="deck-brand">
+          <span className="deck-mark">H</span>
           <div>
-            <p className="eyebrow">Meta Quest Embodied Preview</p>
-            <h1>Hermes stays in front. Worker noise stays under control.</h1>
-            <p className="hero-copy">
-              Hermes still runs the coding flow from the Mac control plane. The headset now prioritizes a readable
-              embodied guide, clearer worker status, and approvals you can act on without squinting through tiny UI.
-            </p>
-            <div className="hero-bullets">
-              <span>Hermes is primary</span>
-              <span>Workers are summonable</span>
-              <span>Approvals stay manager-routed</span>
+            <p className="eyebrow">Hermes OS <span className="deck-version">v2.1.3</span></p>
+            <strong>AI Orchestration System</strong>
+          </div>
+        </div>
+
+        <div className="mode-bank" aria-label="Hermes mode">
+          {(["listening", "thinking", "working", "blocked", "ready"] as const).map((mode) => {
+            const isBlocked = client.pendingSession || client.attentionSessions.some((session) => session.workerPhase === "blocked");
+            const active =
+              mode === "listening"
+                ? isListening || client.avatarState.mode === "listening" || client.avatarState.mode === "speaking"
+                : mode === "thinking"
+                  ? client.avatarState.mode === "thinking"
+                  : mode === "working"
+                    ? client.hermesPhase.tone === "working"
+                    : mode === "blocked"
+                      ? Boolean(isBlocked)
+                      : client.hermesPhase.tone === "success" || client.hermesPhase.tone === "calm";
+            return (
+              <span key={mode} className={`mode-line ${active ? "is-active" : ""} mode-${mode}`}>
+                <i />
+                {mode}
+              </span>
+            );
+          })}
+        </div>
+
+        <div className={`deck-state-card ${toneClass(client.hermesPhase.tone)}`}>
+          <p className="eyebrow">Hermes State</p>
+          <strong>{client.hermesPhase.title}</strong>
+          <small>{client.hermesPhase.subtitle}</small>
+          <span>{client.workerStats.live} live worker{client.workerStats.live === 1 ? "" : "s"}</span>
+        </div>
+
+        <div className="deck-connection">
+          <p className="eyebrow">Connection</p>
+          <strong>Quest <span>↔</span> Mac</strong>
+          <small>{compactConnectionStatus}</small>
+        </div>
+
+        <div className="deck-header-controls">
+          <button className="header-control-button" onClick={connect}>
+            {client.isConnected ? "Reconnect" : "Connect"}
+          </button>
+          <button className="header-control-button" onClick={() => client.disconnect()}>
+            Disconnect
+          </button>
+        </div>
+
+        <button
+          type="button"
+          className="deck-xr-pill"
+          onClick={() => {
+            const directEnterXR = window.__xrAgentEnterXR;
+            if (typeof directEnterXR === "function") {
+              directEnterXR();
+              return;
+            }
+            const stageButton = document.querySelector<HTMLButtonElement>(".quest-xr-button:not(:disabled)");
+            if (stageButton) {
+              stageButton.click();
+              return;
+            }
+            window.dispatchEvent(new Event("xr-agent-enter-xr"));
+          }}
+        >
+          <span>Enter XR</span>
+          <small>Immersive mode</small>
+        </button>
+
+        <div className="deck-code">
+          <strong>02</strong>
+          <small>HS-02</small>
+        </div>
+
+        <label className="deck-project">
+          <span>Project</span>
+          <input
+            value={repoPath}
+            onChange={(event) => setRepoPath(event.target.value)}
+            placeholder="~/work/MetaQuest"
+          />
+        </label>
+      </section>
+
+      <section className="deck-grid">
+        <aside className="deck-panel signal-deck">
+          <header className="panel-header compact">
+            <div>
+              <p className="eyebrow">Signal Feed</p>
+              <h2>Live events</h2>
             </div>
+            <button className="mini-button" onClick={() => client.requestSessionSync()}>
+              Sync
+            </button>
+          </header>
+
+          <div className="feed-list scroll-surface deck-feed">
+            {client.signalEvents.length === 0 ? (
+              <div className="empty-state">No events yet.</div>
+            ) : (
+              client.signalEvents.slice(0, 10).map((event) => (
+                <article key={`${event.ts}-${event.type}-${event.session_id ?? "none"}`} className="feed-item deck-feed-item">
+                  <time>{formatEventTime(event.ts)}</time>
+                  <strong>{signalLabel(event)}</strong>
+                  <p>{summarizeSignal(event)}</p>
+                </article>
+              ))
+            )}
           </div>
 
+          <div className="deck-mini-status">
+            <div>
+              <span>Workers</span>
+              <strong>{client.workerStats.live}</strong>
+            </div>
+            <div>
+              <span>Signals</span>
+              <strong>{client.signalEvents.length}</strong>
+            </div>
+            <div>
+              <span>State</span>
+              <strong>{miniConnectionStatus}</strong>
+            </div>
+          </div>
+        </aside>
+
+        <section className="deck-center">
           <Suspense
             fallback={
               <div className="presence-stage stage-fallback">
                 <div className="summary-card">
                   <p className="summary-title">Loading Yuki stage</p>
-                  <p className="summary-body">
-                    Pulling in the avatar and XR runtime without blocking the rest of the coding companion.
-                  </p>
+                  <p className="summary-body">Avatar runtime starting.</p>
                 </div>
               </div>
             }
@@ -557,416 +1009,58 @@ export default function App() {
               speechPulseAt={speechPulseAt}
               speechSpeaking={speechSpeaking}
               latestTranscript={latestTranscript}
+              signalEvents={client.signalEvents}
+              activityEvents={client.events}
+              micAvailable={voiceAvailable}
+              micActive={isListening}
+              onToggleMic={toggleVoicePrompt}
               leadSession={detailSession}
               sessions={client.liveSessions}
               latestSummary={
                 client.latestHermesUpdate
                   ? summarizeSignal(client.latestHermesUpdate)
-                  : "Hermes is ready to step into the room when you connect."
+                  : "Hermes is ready."
               }
             />
           </Suspense>
-        </div>
 
-        <div className="hero-stats">
-          <div className="stat-card">
-            <span className="stat-label">Hermes</span>
-            <strong>{client.hermesPhase.title}</strong>
-            <span>{client.hermesPhase.subtitle}</span>
-          </div>
-          <div className="stat-card">
-            <span className="stat-label">Live workers</span>
-            <strong>{client.workerStats.live}</strong>
-            <span>
-              {client.workerStats.attention > 0
-                ? `${client.workerStats.attention} worker${client.workerStats.attention === 1 ? "" : "s"} need attention.`
-                : "Worker board is synced."}
-            </span>
-          </div>
-          <div className="stat-card">
-            <span className="stat-label">Signal feed</span>
-            <strong>{client.signalEvents.length}</strong>
-            <span>Hermes-first updates, raw terminal babysitting second.</span>
-          </div>
-        </div>
-      </section>
-
-      <div className="layout-grid">
-        <section className="panel stack-panel">
-          <header className="panel-header">
-            <div>
-              <p className="eyebrow">Connection</p>
-              <h2>Quest to Mac</h2>
-            </div>
-            <span className={`phase-pill ${toneClass(client.hermesPhase.tone)}`}>{client.statusText}</span>
-          </header>
-
-          <div className="field-grid">
-            <label className="field">
-              <span>Connection mode</span>
-              <select
-                value={connectionMode}
-                onChange={(event) => setConnectionMode(event.target.value as "bridge" | "direct")}
-              >
-                {BRIDGE_ENABLED ? <option value="bridge">Same-origin bridge</option> : null}
-                <option value="direct">Direct socket</option>
-              </select>
-            </label>
-            {connectionMode === "direct" ? (
-              <>
-                <label className="field">
-                  <span>Transport</span>
-                  <select value={scheme} onChange={(event) => setScheme(event.target.value as "ws" | "wss")}>
-                    <option value="ws">ws</option>
-                    <option value="wss">wss</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span>Mac host</span>
-                  <input value={host} onChange={(event) => setHost(event.target.value)} placeholder="192.168.1.25" />
-                </label>
-                <label className="field">
-                  <span>WebSocket port</span>
-                  <input
-                    value={port}
-                    onChange={(event) => setPort(event.target.value)}
-                    inputMode="numeric"
-                    placeholder="8765"
-                  />
-                </label>
-              </>
-            ) : null}
-          </div>
-
-          <div className="summary-card">
-            <p className="summary-title">{connectionGuidanceTitle}</p>
-            <p className="summary-body">{effectiveTargetUrl}</p>
-            <p className="detail-note">{connectionGuidanceBody}</p>
-          </div>
-
-          {connectionWarning ? (
-            <div className="decision-card">
-              <span className="banner-label">Run reliability note</span>
-              <p>{connectionWarning}</p>
-            </div>
-          ) : null}
-
-          <div className="detail-meta">
-            <div>
-              <span className="meta-label">Socket state</span>
-              <strong>{client.connectionState.mode}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Last connected</span>
-              <strong>{client.connectionState.lastConnectedUrl ?? "None yet"}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Event flow</span>
-              <strong>{client.connectionState.hasReceivedEvents ? `Last event ${formatTimestamp(client.connectionState.lastEventTs)}` : "Waiting for first event"}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Fastest fallback</span>
-              <strong>
-                {connectionMode === "bridge"
-                  ? "Switch to direct + Mac LAN IP"
-                  : BRIDGE_ENABLED
-                    ? "Switch to bridge if a proxy is available"
-                    : "Stay direct and verify the Mac LAN IP"}
-              </strong>
-            </div>
-          </div>
-
-          <label className="field">
-            <span>Current project</span>
-            <input
-              value={repoPath}
-              onChange={(event) => setRepoPath(event.target.value)}
-              placeholder="/Users/you/project"
-            />
-          </label>
-
-          <div className="button-row utility-row">
-            <button className="primary-button" onClick={connect}>
-              {client.isConnected ? "Reconnect" : connectionMode === "bridge" ? "Connect Through Bridge" : "Connect Directly"}
+          <section className="deck-panel voice-console">
+            <button
+              className={`voice-orb ${isListening ? "is-listening" : ""}`}
+              onClick={toggleVoicePrompt}
+              disabled={!voiceAvailable}
+              title={voiceAvailable ? "Toggle microphone" : "Microphone capture needs the secure HTTPS Quest URL"}
+            >
+              <span>{isListening ? "Send" : "Mic"}</span>
             </button>
-            <button className="secondary-button" onClick={() => client.disconnect()}>
-              Disconnect
-            </button>
-            {BRIDGE_ENABLED ? (
-              <button
-                className="secondary-button"
-                onClick={() => {
-                  setConnectionMode("bridge");
-                  setScheme(DEFAULT_SCHEME);
+            <div className="waveform" aria-hidden="true">
+              {Array.from({ length: 42 }, (_, index) => (
+                <i key={index} style={{ "--bar": `${18 + ((index * 17) % 54)}%` } as CSSProperties} />
+              ))}
+            </div>
+            <label className="command-line">
+              <span>&gt;</span>
+              <input
+                value={hermesPrompt}
+                onChange={(event) => setHermesPrompt(event.target.value)}
+                placeholder="Input channel open"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    sendHermesPrompt();
+                  }
                 }}
-              >
-                Use Bridge
-              </button>
-            ) : null}
-            <button
-              className="secondary-button"
-              onClick={() => {
-                setConnectionMode("direct");
-                setHost(window.location.hostname || "127.0.0.1");
-                setScheme(DEFAULT_SCHEME);
-              }}
-            >
-              Use Page Host
+              />
+            </label>
+            <button className="primary-button send-button" onClick={sendHermesPrompt}>
+              Send
             </button>
-            <button className="secondary-button" onClick={() => client.requestProjectPicker(repoPath.trim() || undefined)}>
-              Pick Folder On Mac
-            </button>
-            <button className="secondary-button" onClick={() => client.requestSessionSync()}>
-              Refresh Workers
-            </button>
-          </div>
-
-          <header className="panel-header compact">
-            <div>
-              <p className="eyebrow">Hermes Panel</p>
-              <h2>Talk to Hermes</h2>
-            </div>
-            <span className={`phase-pill ${toneClass(client.hermesPhase.tone)}`}>{client.hermesPhase.title}</span>
-          </header>
-
-          <div className="summary-card">
-            <p className="summary-title">Headset next step</p>
-            <p className="summary-body">{client.headsetPrompt.title}</p>
-            <p className="detail-note">{client.headsetPrompt.detail}</p>
-          </div>
-
-          <div className="summary-card">
-            <p className="summary-title">Latest manager summary</p>
-            <p className="summary-body">
-              {client.latestHermesUpdate ? summarizeSignal(client.latestHermesUpdate) : "Hermes is ready for the next instruction."}
-            </p>
-          </div>
-
-          <div className="detail-meta">
-            <div>
-              <span className="meta-label">Yuki voice loop</span>
-              <strong>{speechEnabled ? "Speaking Hermes replies" : "Voice playback muted"}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Avatar state</span>
-              <strong>{client.avatarState.mode}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Current project</span>
-              <strong>{repoPath.trim() || "Not set yet"}</strong>
-            </div>
-            <div>
-              <span className="meta-label">Focus worker</span>
-              <strong>{sessionLabel(client.prioritySession)}</strong>
-            </div>
-          </div>
-
-          <div className="button-row utility-row">
-            <button
-              className="secondary-button"
-              onClick={() => focusWorker(client.headsetPrompt.sessionId)}
-              disabled={!client.headsetPrompt.sessionId}
-            >
-              Focus Next Step
-            </button>
-            <button
-              className="secondary-button"
-              onClick={() => setHermesPrompt("Summarize the active workers and tell me what needs attention.")}
-            >
-              Prep Worker Summary
-            </button>
-          </div>
-
-          <div className="button-row action-row">
-            <button className="primary-button" onClick={mostUsefulAction.action}>
-              {mostUsefulAction.label}
-            </button>
-            <button className="secondary-button" onClick={secondaryAction.action}>
-              {secondaryAction.label}
-            </button>
-            <button
-              className="secondary-button"
-              onClick={() => sendSuggestedPrompt("Tell me the single most important next step and who is doing it.")}
-            >
-              Single Next Step
-            </button>
-          </div>
-
-          {latestTranscript ? (
-            <div className="summary-card">
-              <p className="summary-title">Latest transcript</p>
-              <p className="summary-body">{latestTranscript}</p>
-            </div>
-          ) : null}
-
-          {latestAssistantText ? (
-            <div className="summary-card">
-              <p className="summary-title">What Hermes just said</p>
-              <p className="summary-body">{latestAssistantText}</p>
-            </div>
-          ) : null}
-
-          <label className="field">
-            <span>Prompt for Hermes</span>
-            <textarea
-              value={hermesPrompt}
-              onChange={(event) => setHermesPrompt(event.target.value)}
-              placeholder="Open Claude in this repo and ask it to investigate the failing auth test."
-              rows={4}
-            />
-          </label>
-
-          <div className="button-row">
-            <button className="primary-button" onClick={sendHermesPrompt}>
-              Send to Hermes
-            </button>
-            <button
-              className="secondary-button"
-              onClick={startVoicePrompt}
-              disabled={!voiceAvailable || isListening}
-              title={voiceAvailable ? "Experimental browser speech capture" : "Speech recognition is not available in this browser"}
-            >
-              {isListening ? "Listening..." : voiceAvailable ? "Voice Prompt" : "Voice Unavailable"}
-            </button>
-            <button className="secondary-button" onClick={() => setSpeechEnabled((current) => !current)}>
-              {speechEnabled ? "Mute Yuki Voice" : "Unmute Yuki Voice"}
-            </button>
-          </div>
-
-          <div className="chip-row">
-            {[
-              "Open Claude here",
-              "Ask Codex to inspect the build failure",
-              "What is Claude 1 doing?",
-              "Summarize the active workers",
-            ].map((prompt) => (
-              <button key={prompt} className="chip-button" onClick={() => sendSuggestedPrompt(prompt)}>
-                {prompt}
-              </button>
-            ))}
-          </div>
+          </section>
         </section>
 
-        <section className="panel stack-panel board-panel">
+        <aside className="deck-panel inspection-deck">
           <header className="panel-header">
             <div>
-              <p className="eyebrow">Hermes Supervisor</p>
-              <h2>Worker board</h2>
-            </div>
-            <span className="panel-meta">
-              {client.pendingSession ? "A decision is waiting." : "Managers summaries first, raw controls second."}
-            </span>
-          </header>
-
-          <div className="summary-card">
-            <p className="summary-title">Next headset step</p>
-            <p className="summary-body">{client.headsetPrompt.title}</p>
-            <p className="detail-note">{client.headsetPrompt.detail}</p>
-          </div>
-
-          <div className="button-row compact-row">
-            <button
-              className="secondary-button"
-              onClick={() => focusWorker(client.pendingSession?.sessionId)}
-              disabled={!client.pendingSession}
-            >
-              Focus Pending
-            </button>
-            <button
-              className="secondary-button"
-              onClick={() => focusWorker(previousWorker?.sessionId)}
-              disabled={!previousWorker}
-            >
-              Previous Worker
-            </button>
-            <button
-              className="secondary-button"
-              onClick={() => focusWorker(nextWorker?.sessionId)}
-              disabled={!nextWorker}
-            >
-              Next Worker
-            </button>
-          </div>
-
-          {client.pendingSession ? (
-            <div className="supervisor-banner">
-              <span className="banner-label">Pending decision</span>
-              <strong>{client.pendingSession.workerLabel ?? client.pendingSession.title}</strong>
-              <p>{client.pendingSession.pendingQuestion ?? client.pendingSession.managerSummary}</p>
-            </div>
-          ) : (
-            <div className="quiet-banner">
-              Hermes will surface important worker changes here when Claude or Codex needs attention.
-            </div>
-          )}
-
-          {client.attentionSessions.length > 0 ? (
-            <div className="summary-card">
-              <p className="summary-title">Attention queue</p>
-              <div className="feed-list">
-                {client.attentionSessions.slice(0, 3).map((session) => (
-                  <article key={session.sessionId} className="feed-item">
-                    <div className="feed-item-top">
-                      <strong>{sessionLabel(session)}</strong>
-                      <time>{sessionStatusCopy(session)}</time>
-                    </div>
-                    <p>{sessionLeadCopy(session)}</p>
-                    <div className="button-row">
-                      <button className="secondary-button" onClick={() => focusWorker(session.sessionId)}>
-                        Inspect
-                      </button>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
-          <div className="worker-list scroll-surface">
-            {client.liveSessions.length === 0 ? (
-              <div className="empty-state">
-                No live workers yet. Ask Hermes to open Claude or Codex and the worker board will populate here.
-              </div>
-            ) : (
-              client.liveSessions.map((session) => (
-                <WorkerCard
-                  key={session.sessionId}
-                  session={session}
-                  isSelected={session.sessionId === detailSession?.sessionId}
-                  onSelect={() => setSelectedWorkerId(session.sessionId)}
-                />
-              ))
-            )}
-          </div>
-
-          <header className="panel-header compact">
-            <div>
-              <p className="eyebrow">Signal Feed</p>
-              <h2>High-signal updates</h2>
-            </div>
-          </header>
-
-          <div className="feed-list scroll-surface feed-surface">
-            {client.signalEvents.length === 0 ? (
-              <div className="empty-state">Connect to the Mac companion and Hermes will start surfacing worker signals here.</div>
-            ) : (
-              client.signalEvents.slice(0, 12).map((event) => (
-                <article key={`${event.ts}-${event.type}-${event.session_id ?? "none"}`} className="feed-item">
-                  <div className="feed-item-top">
-                    <strong>{signalLabel(event)}</strong>
-                    <time>{formatEventTime(event.ts)}</time>
-                  </div>
-                  <p>{summarizeSignal(event)}</p>
-                </article>
-              ))
-            )}
-          </div>
-        </section>
-
-        <section className="panel detail-panel sticky-panel">
-          <header className="panel-header">
-            <div>
-              <p className="eyebrow">Worker Detail</p>
+              <p className="eyebrow">Inspection Bay</p>
               <h2>{sessionLabel(detailSession)}</h2>
             </div>
             {detailSession ? (
@@ -1026,18 +1120,18 @@ export default function App() {
                 <div className="decision-card">
                   <span className="banner-label">Worker needs you</span>
                   <p>{detailSession.pendingQuestion}</p>
-                  <div className="button-row">
+                  <div className="button-row approval-row">
                     <button
                       className="primary-button"
                       onClick={() => client.sendWorkerReply(detailSession.sessionId, "approve", true)}
                     >
-                      Approve via Hermes
+                      Execute
                     </button>
                     <button
                       className="secondary-button"
                       onClick={() => client.sendWorkerReply(detailSession.sessionId, "not yet", true)}
                     >
-                      Reject via Hermes
+                      Abort
                     </button>
                   </div>
                   <div className="chip-row">
@@ -1167,27 +1261,120 @@ export default function App() {
             </>
           ) : (
             <div className="empty-state">
-              Open a worker from Hermes and select it from the worker board to inspect the live session surface here.
+              No worker selected.
             </div>
           )}
+        </aside>
+
+        <section className="deck-panel connection-console">
+          <header className="panel-header compact">
+            <div>
+              <p className="eyebrow">Bridge</p>
+              <h2>Quest to Mac</h2>
+            </div>
+            <span className={`phase-pill ${toneClass(client.hermesPhase.tone)}`}>{compactConnectionStatus}</span>
+          </header>
+          <div className="field-grid compact-fields">
+            <label className="field">
+              <span>Mode</span>
+              <select
+                value={connectionMode}
+                onChange={(event) => setConnectionMode(event.target.value as "bridge" | "direct")}
+              >
+                {BRIDGE_ENABLED ? <option value="bridge">Same-origin bridge</option> : null}
+                <option value="direct">Direct socket</option>
+              </select>
+            </label>
+            {connectionMode === "direct" ? (
+              <>
+                <label className="field">
+                  <span>Host</span>
+                  <input value={host} onChange={(event) => setHost(event.target.value)} placeholder="192.168.1.25" />
+                </label>
+                <label className="field">
+                  <span>Port</span>
+                  <input value={port} onChange={(event) => setPort(event.target.value)} inputMode="numeric" />
+                </label>
+              </>
+            ) : null}
+          </div>
+          <p className="deck-url">{effectiveTargetUrl}</p>
+          {connectionDetail && connectionDetail !== connectionWarning ? (
+            <p className="connection-detail">{connectionDetail}</p>
+          ) : null}
+          {connectionWarning ? <p className="deck-warning">{connectionWarning}</p> : null}
+          <div className="button-row compact-row">
+            <button className="primary-button" onClick={connect}>
+              {client.isConnected ? "Reconnect" : "Connect"}
+            </button>
+            <button className="secondary-button" onClick={() => client.disconnect()}>
+              Disconnect
+            </button>
+            <button className="secondary-button" onClick={() => client.requestProjectPicker(repoPath.trim() || undefined)}>
+              Pick Folder
+            </button>
+          </div>
         </section>
-      </div>
+
+        <section className="deck-panel worker-channels">
+          <header className="panel-header compact">
+            <div>
+              <p className="eyebrow">Worker Channels</p>
+              <h2>{client.liveSessions.length} active</h2>
+            </div>
+            <div className="panel-actions">
+              <button className="mini-button" onClick={mostUsefulAction.action}>
+                {mostUsefulAction.label}
+              </button>
+              <button className="mini-button ghost" onClick={secondaryAction.action}>
+                {secondaryAction.label}
+              </button>
+            </div>
+          </header>
+          <div className="worker-channel-grid">
+            {client.liveSessions.length === 0 ? (
+              <div className="worker-slot empty-state">No active workers.</div>
+            ) : (
+              client.liveSessions.slice(0, 4).map((session, index) => (
+                <WorkerCard
+                  key={session.sessionId}
+                  session={session}
+                  index={index}
+                  isSelected={session.sessionId === detailSession?.sessionId}
+                  onSelect={() => setSelectedWorkerId(session.sessionId)}
+                />
+              ))
+            )}
+            {client.liveSessions.length < 4
+              ? Array.from({ length: 4 - client.liveSessions.length }, (_, index) => (
+                  <div key={`empty-${index}`} className="worker-slot">
+                    <strong>{String(client.liveSessions.length + index + 1).padStart(2, "0")}</strong>
+                    <span>Worker slot</span>
+                  </div>
+                ))
+              : null}
+          </div>
+        </section>
+      </section>
     </main>
   );
 }
 
 function WorkerCard({
   session,
+  index,
   isSelected,
   onSelect,
 }: {
   session: CodingSessionSnapshot;
+  index: number;
   isSelected: boolean;
   onSelect: () => void;
 }) {
   return (
     <button className={`worker-card ${isSelected ? "selected" : ""}`} onClick={onSelect}>
       <div className="worker-card-top">
+        <span className="worker-number">{String(index + 1).padStart(2, "0")}</span>
         <div>
           <strong>{session.workerLabel ?? session.title}</strong>
           <p>{session.taskTitle ?? session.statusText ?? session.command ?? "Working"}</p>

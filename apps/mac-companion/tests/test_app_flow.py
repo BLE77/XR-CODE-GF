@@ -612,6 +612,63 @@ def test_generic_followup_prefers_explicit_repo_path_over_last_completed_session
     app.coding_sessions.shutdown()
 
 
+def test_taskful_open_worker_request_delegates_to_hermes_supervisor(tmp_path) -> None:
+    claude_launcher = tmp_path / "fake_claude_worker.py"
+    claude_launcher.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "print('Claude ready', flush=True)",
+                "for line in sys.stdin:",
+                "    text = line.rstrip('\\n')",
+                "    if text == 'exit':",
+                "        break",
+                "    print(f'CLAUDE RECEIVED: {text}', flush=True)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    decision = {
+        "action": "open_and_send_to_session",
+        "target": "open_claude_code",
+        "repo_path": str(tmp_path),
+        "content": "fix the auth bug and report back",
+        "reply_text": "I opened Claude and gave it the task.",
+    }
+    app = build_app(AppConfig(hermes_cmd="hermes", state_dir=tmp_path / "state"))
+    app.hermes_runtime = FakeHermesRuntime(json.dumps(decision))
+    app.coding_sessions = ManagedCodingSessionManager(
+        tools={
+            "open_claude_code": CodingSessionTool(
+                intent="open_claude_code",
+                title="Claude Code",
+                argv=(sys.executable, str(claude_launcher)),
+            )
+        }
+    )
+
+    app._can_delegate_session_management_to_hermes = lambda: True
+    response = app.handle_text(
+        "open claude and have it fix the auth bug and report back",
+        repo_path=str(tmp_path),
+    )
+
+    assert response["message"] == "I opened Claude and gave it the task."
+    assert app.hermes_runtime.calls
+    assert "User request: open claude and have it fix the auth bug and report back" in app.hermes_runtime.calls[0]["prompt"]
+    session = _wait_for_coding_session(app, "open_claude_code")
+    assert session is not None
+    _wait_for(
+        lambda: any(
+            "CLAUDE RECEIVED: fix the auth bug and report back" in line
+            for line in (app.coding_sessions.get(session.session_id).output_tail or [])
+        ),
+        timeout=5,
+    )
+    app.coding_sessions.shutdown()
+
+
 def test_explicit_worker_label_instruction_routes_to_matching_claude_worker_without_opening_hermes(tmp_path) -> None:
     claude_launcher = tmp_path / "fake_claude_worker.py"
     claude_launcher.write_text(
@@ -1551,6 +1608,23 @@ def test_respond_includes_backend_voice_payload_when_available(tmp_path) -> None
     assert payload["voice_provider"] == "elevenlabs"
     assert payload["voice_name"] == "Yuki"
     assert payload["voice_model_id"] == "eleven_flash_v2_5"
+
+
+def test_non_project_status_prompt_does_not_scan_project_roots(tmp_path, monkeypatch) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    def fail_scan(_: str):
+        raise AssertionError("project root scan should not run")
+
+    monkeypatch.setattr(app, "_candidate_project_paths", fail_scan)
+
+    repo_path, transcript = app._resolve_repo_path_from_transcript(
+        str(tmp_path),
+        "what needs me next across the active workers?",
+    )
+
+    assert repo_path == str(tmp_path)
+    assert transcript == "what needs me next across the active workers?"
 
 
 def _wait_for_coding_session(app, intent: str, timeout: float = 5):

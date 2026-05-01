@@ -11,10 +11,22 @@
         "avatar.thinking",
         "avatar.speaking",
         "speech.transcript",
+        "project.selected",
+        "hermes.status",
+        "assistant.reply",
         "session.started",
         "session.output",
         "session.finished",
         "session.failed",
+        "terminal.started",
+        "terminal.input",
+        "terminal.output",
+        "terminal.screen",
+        "terminal.finished",
+        "terminal.failed",
+        "worker.updated",
+        "worker.pending_question",
+        "coding_sessions.synced",
         "agent.summary"
       ]
     },
@@ -22,7 +34,7 @@
       "type": "string"
     },
     "session_id": {
-      "type": "string"
+      "type": ["string", "null"]
     },
     "payload": {
       "type": "object"

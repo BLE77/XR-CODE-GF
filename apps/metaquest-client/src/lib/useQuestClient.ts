@@ -43,6 +43,23 @@ interface ConnectionState {
   lastEventTs?: string;
 }
 
+type CodingWorkerTool = "claude" | "codex" | "hermes";
+
+type OpenCodingSessionOptions = {
+  dangerouslySkipPermissions?: boolean;
+};
+
+function intentForWorkerTool(tool: CodingWorkerTool): string {
+  switch (tool) {
+    case "claude":
+      return "open_claude_code";
+    case "codex":
+      return "open_codex";
+    case "hermes":
+      return "open_hermes_cli";
+  }
+}
+
 function estimateSpeechDurationMs(text: string | undefined, explicitDurationMs?: number): number {
   if (explicitDurationMs && Number.isFinite(explicitDurationMs)) {
     return Math.max(800, explicitDurationMs);
@@ -53,11 +70,20 @@ function estimateSpeechDurationMs(text: string | undefined, explicitDurationMs?:
   return Math.max(2200, Math.min(9000, text.trim().length * 58));
 }
 
+function connectionFailureCopy(targetUrl: string): string {
+  if (targetUrl.includes("/xr-agent-events")) {
+    return `Could not open ${targetUrl}. Start the Mac companion so Vite can proxy to ws://127.0.0.1:8765, or switch to Direct socket and enter your Mac host.`;
+  }
+  return `Could not open ${targetUrl}.`;
+}
+
 function nextStatusForEvent(eventType: string, current: CodingSessionStatus): CodingSessionStatus {
   switch (eventType) {
     case "terminal.finished":
+    case "session.finished":
       return "finished";
     case "terminal.failed":
+    case "session.failed":
       return "failed";
     default:
       return current;
@@ -443,6 +469,7 @@ export function useQuestClient() {
 
       switch (event.type) {
         case "terminal.started":
+        case "session.started":
           updated = applyWorkerPayload(event, {
             ...current,
             title: payloadText(event.payload, "title") ?? current.title,
@@ -454,6 +481,17 @@ export function useQuestClient() {
           });
           break;
         case "terminal.output": {
+          const line = payloadText(event.payload, "line");
+          updated = applyWorkerPayload(event, {
+            ...current,
+            title: payloadText(event.payload, "title") ?? current.title,
+            repoPath: payloadText(event.payload, "repo_path") ?? current.repoPath,
+            logPath: payloadText(event.payload, "log_path") ?? current.logPath,
+            outputTail: line ? [...current.outputTail, line].slice(-24) : current.outputTail,
+          });
+          break;
+        }
+        case "session.output": {
           const line = payloadText(event.payload, "line");
           updated = applyWorkerPayload(event, {
             ...current,
@@ -508,6 +546,8 @@ export function useQuestClient() {
           break;
         case "terminal.finished":
         case "terminal.failed":
+        case "session.finished":
+        case "session.failed":
           updated = applyWorkerPayload(event, {
             ...current,
             title: payloadText(event.payload, "title") ?? current.title,
@@ -672,12 +712,17 @@ export function useQuestClient() {
         firstEventTimeoutRef.current = null;
       }
       setIsConnected(false);
-      setStatusText("WebSocket connection failed.");
+      const failureCopy = connectionFailureCopy(targetUrl);
+      setStatusText(
+        targetUrl.includes("/xr-agent-events")
+          ? "Bridge failed. Start the Mac companion or switch to direct."
+          : "WebSocket connection failed.",
+      );
       setConnectionState((current) => ({
         ...current,
         mode: "error",
         targetUrl,
-        lastError: `Could not open ${targetUrl}.`,
+        lastError: failureCopy,
       }));
     });
 
@@ -751,6 +796,37 @@ export function useQuestClient() {
     });
     if (sent) {
       setStatusText("Sent command to Hermes.");
+    }
+    return sent;
+  }
+
+  function sendVoiceAudio(audioBase64: string, mimeType: string, repoPath?: string) {
+    const sent = sendMessage({
+      type: "voice.audio",
+      payload: {
+        audio_base64: audioBase64,
+        mime_type: mimeType,
+        ...(repoPath ? { repo_path: repoPath } : {}),
+      },
+    });
+    if (sent) {
+      setStatusText("Sent microphone audio to Hermes.");
+    }
+    return sent;
+  }
+
+  function openCodingSession(tool: CodingWorkerTool, repoPath?: string, options: OpenCodingSessionOptions = {}) {
+    const sent = sendMessage({
+      type: "coding_session.open",
+      payload: {
+        intent: intentForWorkerTool(tool),
+        repo_path: repoPath || ".",
+        ...(options.dangerouslySkipPermissions ? { dangerously_skip_permissions: true } : {}),
+      },
+    });
+    if (sent) {
+      const label = tool === "claude" ? "Claude" : tool === "codex" ? "Codex" : "Hermes";
+      setStatusText(`Opening ${label} worker...`);
     }
     return sent;
   }
@@ -850,11 +926,13 @@ export function useQuestClient() {
     liveSessions,
     pendingSession,
     prioritySession,
+    openCodingSession,
     requestProjectPicker,
     requestSessionSync,
     selectedProjectPath,
     sendDirectWorkerInput,
     sendHermesCommand,
+    sendVoiceAudio,
     sendWorkerReply,
     sessions,
     signalEvents,

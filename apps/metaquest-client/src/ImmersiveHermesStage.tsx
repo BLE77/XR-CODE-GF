@@ -17,17 +17,39 @@ import {
   VRMHumanBoneName,
   type VRM,
 } from "@pixiv/three-vrm";
-import type { CodingSessionSnapshot } from "./lib/protocol";
+import {
+  formatEventTime,
+  payloadText,
+  signalLabel,
+  summarizeSignal,
+  type AgentWireEvent,
+  type CodingSessionSnapshot,
+} from "./lib/protocol";
+import { createYukiMotionEngine, type YukiMotionEngine, type YukiMotionState } from "./lib/yukiMotionEngine";
+import {
+  createYukiBehaviorPlannerState,
+  planYukiBehavior,
+  type YukiBehaviorPlannerState,
+} from "./lib/yukiBehaviorPlanner";
+import {
+  createSpatialAffordanceStore,
+  type SpatialAffordance,
+  type SpatialAffordanceKind,
+  type SpatialAffordanceStore,
+  type SpatialSurfaceObservation,
+} from "./lib/spatialAffordances";
 
 const YUKI_ASSET_CANDIDATES = ["/vrms/Yuki.glb", "/vrms/Yuki.vrm"] as const;
 
 type StageTone = "calm" | "working" | "attention" | "success";
 type CharacterState = "idle" | "listening" | "working" | "alert" | "ready";
 type AvatarMode = "idle" | "listening" | "thinking" | "speaking";
-type AnimationState = "idle" | "listening" | "thinking" | "speaking" | "alert" | "ready";
+type AnimationState = YukiMotionState;
 type AvatarLoadState = "loading" | "ready" | "fallback";
 type XRState = "checking" | "ready" | "entering" | "active" | "unsupported" | "failed";
 type AvatarClipState = "idle" | "listening" | "thinking" | "speaking" | "alert";
+type XrDeckMode = "expanded" | "compact" | "hidden";
+type XrDeckAnchor = "left" | "front" | "right";
 
 type ImmersiveHermesStageProps = {
   characterState: CharacterState;
@@ -39,6 +61,11 @@ type ImmersiveHermesStageProps = {
   speechPulseAt: number;
   speechSpeaking: boolean;
   latestTranscript?: string;
+  signalEvents: AgentWireEvent[];
+  activityEvents: AgentWireEvent[];
+  micAvailable: boolean;
+  micActive: boolean;
+  onToggleMic: () => void;
   leadSession?: CodingSessionSnapshot;
   sessions: CodingSessionSnapshot[];
 };
@@ -50,11 +77,65 @@ type PanelCard = {
   mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
 };
 
+type XrPanelKey = "summary" | "worker" | "status";
+
+type HermesChatMessage = {
+  speaker: "user" | "hermes" | "worker";
+  label: string;
+  text: string;
+};
+
 type FallbackRig = {
   group: THREE.Group;
   head: THREE.Mesh<THREE.SphereGeometry, THREE.MeshStandardMaterial>;
   body: THREE.Mesh<THREE.CapsuleGeometry, THREE.MeshStandardMaterial>;
   core: THREE.Mesh<THREE.SphereGeometry, THREE.MeshStandardMaterial>;
+};
+
+type XRHandSpaceLike = THREE.Group & {
+  joints?: Partial<Record<XRHandJoint, THREE.Object3D>>;
+  inputState?: {
+    pinching?: boolean;
+  };
+};
+
+type XRControllerWithInputSource = THREE.Group & {
+  userData: {
+    inputSource?: XRInputSource;
+    [key: string]: unknown;
+  };
+};
+
+type WristMicControl = {
+  group: THREE.Group;
+  base: THREE.Mesh<THREE.CircleGeometry, THREE.MeshStandardMaterial>;
+  face: THREE.Mesh<THREE.CircleGeometry, THREE.MeshBasicMaterial>;
+  ring: THREE.Mesh<THREE.TorusGeometry, THREE.MeshStandardMaterial>;
+  glow: THREE.Mesh<THREE.SphereGeometry, THREE.MeshBasicMaterial>;
+  hitTarget: THREE.Mesh<THREE.BoxGeometry, THREE.MeshBasicMaterial>;
+  canvas: HTMLCanvasElement;
+  context: CanvasRenderingContext2D;
+  texture: THREE.CanvasTexture;
+  raycaster: THREE.Raycaster;
+  tempMatrix: THREE.Matrix4;
+  tempPosition: THREE.Vector3;
+  tempQuaternion: THREE.Quaternion;
+  tempScale: THREE.Vector3;
+  tempVector: THREE.Vector3;
+  tempVectorB: THREE.Vector3;
+  visualState: string;
+  pressPulseUntil: number;
+};
+
+type XrUiPlacementState = {
+  targetPosition: THREE.Vector3;
+  targetQuaternion: THREE.Quaternion;
+  cameraPosition: THREE.Vector3;
+  cameraQuaternion: THREE.Quaternion;
+  cameraForward: THREE.Vector3;
+  cameraRight: THREE.Vector3;
+  cameraEuler: THREE.Euler;
+  recenterRequested: boolean;
 };
 
 type StageRuntime = {
@@ -73,17 +154,73 @@ type StageRuntime = {
   beacon: THREE.Mesh<THREE.SphereGeometry, THREE.MeshStandardMaterial>;
   fallbackRig: FallbackRig;
   fillLight: THREE.DirectionalLight;
+  xrUiRoot: THREE.Group;
+  xrUi: XrUiPlacementState;
   panels: {
     summary: PanelCard;
     worker: PanelCard;
     status: PanelCard;
   };
+  wristMic: WristMicControl;
+  leftHand: XRHandSpaceLike;
+  rightHand: XRHandSpaceLike;
+  leftGrip: THREE.Group;
+  rightGrip: THREE.Group;
+  leftController: THREE.Group;
+  rightController: THREE.Group;
   vrm: VRM | null;
   avatarScene: THREE.Object3D | null;
   avatarMode: LoadedAvatar["mode"] | null;
   avatarRig: AvatarRig | null;
   avatarAnimations: AvatarAnimationController | null;
   avatarMorphs: SceneMorphController | null;
+  avatarGrounding: AvatarGroundingState;
+  avatarPlacement: AvatarPlacementState;
+  spatialAffordances: SpatialAffordanceStore;
+  affordanceDebug: AffordanceDebugVisuals;
+  spatialBehavior: YukiBehaviorPlannerState;
+  motionEngine: YukiMotionEngine;
+};
+
+type PreviewLocomotionState = {
+  keys: Set<string>;
+  position: THREE.Vector3;
+  defaultPosition: THREE.Vector3;
+  iwerDefaultPosition: THREE.Vector3;
+  iwerDefaultCaptured: boolean;
+  yaw: number;
+  pitch: number;
+  defaultYaw: number;
+  defaultPitch: number;
+  iwerDefaultYaw: number;
+  iwerDefaultPitch: number;
+  resetRequested: boolean;
+  forward: THREE.Vector3;
+  right: THREE.Vector3;
+  move: THREE.Vector3;
+  euler: THREE.Euler;
+  quaternion: THREE.Quaternion;
+};
+
+type IwerVector3Like = {
+  x: number;
+  y: number;
+  z: number;
+  set?: (x: number, y: number, z: number) => unknown;
+};
+
+type IwerQuaternionLike = {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+  set?: (x: number, y: number, z: number, w: number) => unknown;
+};
+
+type IwerDeviceLike = {
+  position?: IwerVector3Like;
+  quaternion?: IwerQuaternionLike;
+  notifyStateChange?: () => void;
 };
 
 declare global {
@@ -93,6 +230,8 @@ declare global {
       xrState: XRState;
       avatarStatus: AvatarLoadState;
     };
+    __xrAgentEnterXR?: () => void;
+    IWER_DEVICE?: IwerDeviceLike;
   }
 }
 
@@ -116,10 +255,18 @@ type AvatarRig = {
   leftUpperArm?: THREE.Bone;
   leftLowerArm?: THREE.Bone;
   leftHand?: THREE.Bone;
+  leftUpperLeg?: THREE.Bone;
+  leftLowerLeg?: THREE.Bone;
+  leftFoot?: THREE.Bone;
+  leftToes?: THREE.Bone;
   rightShoulder?: THREE.Bone;
   rightUpperArm?: THREE.Bone;
   rightLowerArm?: THREE.Bone;
   rightHand?: THREE.Bone;
+  rightUpperLeg?: THREE.Bone;
+  rightLowerLeg?: THREE.Bone;
+  rightFoot?: THREE.Bone;
+  rightToes?: THREE.Bone;
   rest: Map<THREE.Bone, THREE.Euler>;
 };
 
@@ -138,10 +285,119 @@ type SceneMorphController = {
   targets: Map<string, MorphTargetBinding[]>;
 };
 
+type AvatarGroundingState = {
+  bounds: THREE.Box3;
+  center: THREE.Vector3;
+  size: THREE.Vector3;
+  samplePosition: THREE.Vector3;
+  smoothedLift: number;
+  lastMeasuredMinY: number;
+};
+
+type AvatarPlacementState = {
+  hasUserPlacement: boolean;
+  anchorPosition: THREE.Vector3;
+  floorY: number;
+  source: "manual" | "autonomous" | null;
+  affordanceKind: SpatialAffordanceKind | null;
+  affordanceId: string | null;
+  reticle: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>;
+  floorPlane: THREE.Plane;
+  ray: THREE.Ray;
+  origin: THREE.Vector3;
+  direction: THREE.Vector3;
+  target: THREE.Vector3;
+  fallbackForward: THREE.Vector3;
+  placedAt: number;
+};
+
+type AffordanceDebugVisuals = {
+  group: THREE.Group;
+  markers: Array<THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMaterial>>;
+};
+
+type XRPlaneLike = {
+  planeSpace?: XRSpace;
+  polygon?: DOMPointReadOnly[];
+  orientation?: string;
+  semanticLabel?: string;
+  lastChangedTime?: number;
+};
+
+type XRFrameWithDetectedPlanes = XRFrame & {
+  detectedPlanes?: Set<XRPlaneLike>;
+};
+
 const SCENE_BACKGROUND = 0x06111c;
+const DESKTOP_SCENE_BACKGROUND = 0xf0f7ff;
+const DESKTOP_SCENE_FOG = 0xe6f1ff;
+const AVATAR_TARGET_HEIGHT = 1.23;
+const AVATAR_BASE_FLOOR_CLEARANCE = 0.025;
+const PREVIEW_AVATAR_FLOOR_LIFT = 0.065;
+const DESKTOP_PREVIEW_AVATAR_FLOOR_LIFT = 0.075;
+const ACTIVE_XR_AVATAR_SCALE_BOOST = 1.24;
+const IWER_SIM_AVATAR_SCALE_BOOST = 0.88;
+const ACTIVE_XR_AVATAR_FLOOR_LIFT = 0.14;
+const IWER_SIM_AVATAR_FLOOR_LIFT = 0.62;
+const AVATAR_GROUND_MAX_LIFT = 0.36;
+const ACTIVE_XR_ASSISTANT_SIDE_X = -0.62;
+const AVATAR_PLACEMENT_DEFAULT_DISTANCE = 1.35;
+const AVATAR_PLACEMENT_MAX_DISTANCE = 3.2;
+const AVATAR_PLACEMENT_RETICLE_LIFT = 0.012;
+const AFFORDANCE_DEBUG_MAX_MARKERS = 10;
+const IWER_SIM_STAGE_DEPTH = -1.92;
+const ACTIVE_XR_STAGE_DEPTH = -1.52;
 const STAGE_DEPTH = -1.92;
 const PANEL_DEPTH = -2.18;
 const ASSISTANT_BASE_Y = 0.18;
+const WRIST_MIC_ON = 0x57f0b7;
+const WRIST_MIC_OFF = 0x7dd3fc;
+const WRIST_MIC_UNAVAILABLE = 0x9aa8bb;
+const WRIST_MIC_RAY_DISTANCE = 1.45;
+const WRIST_MIC_TOUCH_RADIUS = 0.13;
+const XR_UI_DISTANCE = 1.72;
+const XR_UI_HEIGHT_OFFSET = 0.04;
+const XR_UI_MIN_HEIGHT = 1.08;
+const XR_UI_MAX_HEIGHT = 1.62;
+const XR_UI_LERP = 0.12;
+const XR_UI_EXPANDED_SCALE = 1;
+const XR_UI_COMPACT_SCALE = 0.82;
+const XR_UI_HIDDEN_SCALE = 0.72;
+const XR_UI_ANCHOR_OFFSET = 0.42;
+const XR_UI_SIDE_PANEL_X = 1.18;
+const XR_UI_SIDE_PANEL_Y = -0.42;
+const XR_UI_CENTER_PANEL_Y = 0.2;
+const XR_UI_STATUS_Y = -0.56;
+const XR_UI_PANEL_TOUCH_RADIUS = 0.14;
+const XR_UI_PANEL_RAY_MARGIN = 0.18;
+const XR_PANEL_ORDER: XrPanelKey[] = ["summary", "worker", "status"];
+const XR_JOYSTICK_AXIS_THRESHOLD = 0.55;
+const XR_JOYSTICK_AXIS_RELEASE = 0.26;
+const XR_JOYSTICK_REPEAT_MS = 240;
+const PREVIEW_WALK_SPEED = 1.25;
+const PREVIEW_FAST_SPEED = 2.8;
+const PREVIEW_VERTICAL_SPEED = 0.85;
+const PREVIEW_TURN_SPEED = 1.6;
+const PREVIEW_CONTROL_KEYS = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "KeyQ",
+  "KeyE",
+  "KeyR",
+  "KeyP",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Space",
+  "KeyC",
+  "PageUp",
+  "PageDown",
+  "ShiftLeft",
+  "ShiftRight",
+]);
 const YUKI_PROTOTYPE_ANIMATIONS: Record<AvatarClipState, string> = {
   idle: "/animations/yuki/prototype/neutral_idle.bvh",
   listening: "/animations/yuki/prototype/curiosity.bvh",
@@ -189,12 +445,12 @@ const XR_REFERENCE_SPACE = {
   fallbackOrder: [ReferenceSpaceType.Local, ReferenceSpaceType.Viewer] as ReferenceSpaceType[],
 };
 const DESKTOP_STAGE_LAYOUT = {
-  cameraPosition: new THREE.Vector3(0, 1.26, 0.94),
-  cameraLookAt: new THREE.Vector3(0, 1.04, -0.48),
-  assistantZ: -1.18,
-  assistantY: 0.03,
+  cameraPosition: new THREE.Vector3(0, 1.34, 1.3),
+  cameraLookAt: new THREE.Vector3(0, 1.04, -0.72),
+  assistantZ: -1.42,
+  assistantY: 0.78,
   avatarZOffset: 0.04,
-  avatarScaleBoost: 0.84,
+  avatarScaleBoost: 0.92,
   panelScale: 1.08,
   summaryPanel: new THREE.Vector3(-1.16, 0.82, -1.18),
   workerPanel: new THREE.Vector3(1.16, 0.82, -1.18),
@@ -249,12 +505,616 @@ function createPanel(position: THREE.Vector3, rotationY: number, scale: [number,
     map: texture,
     transparent: true,
     side: THREE.DoubleSide,
+    depthTest: false,
+    depthWrite: false,
   });
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(scale[0], scale[1]), material);
   mesh.position.copy(position);
   mesh.rotation.y = rotationY;
+  mesh.renderOrder = 30;
 
   return { canvas, context, texture, mesh };
+}
+
+function createXrUiPlacementState(): XrUiPlacementState {
+  return {
+    targetPosition: new THREE.Vector3(),
+    targetQuaternion: new THREE.Quaternion(),
+    cameraPosition: new THREE.Vector3(),
+    cameraQuaternion: new THREE.Quaternion(),
+    cameraForward: new THREE.Vector3(),
+    cameraRight: new THREE.Vector3(1, 0, 0),
+    cameraEuler: new THREE.Euler(0, 0, 0, "YXZ"),
+    recenterRequested: true,
+  };
+}
+
+function createWristMicControl(): WristMicControl {
+  const group = new THREE.Group();
+  group.name = "wrist-mic-control";
+
+  const base = new THREE.Mesh(
+    new THREE.CircleGeometry(0.076, 64),
+    new THREE.MeshStandardMaterial({
+      color: 0x06131f,
+      emissive: 0x0f3044,
+      emissiveIntensity: 0.14,
+      transparent: true,
+      opacity: 0.56,
+      roughness: 0.42,
+      metalness: 0.24,
+      side: THREE.DoubleSide,
+    }),
+  );
+  base.position.z = 0.008;
+  group.add(base);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 512;
+  canvas.height = 512;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("Failed to create wrist mic canvas context.");
+  }
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = 8;
+
+  const glow = new THREE.Mesh(
+    new THREE.SphereGeometry(0.078, 24, 24),
+    new THREE.MeshBasicMaterial({
+      color: WRIST_MIC_UNAVAILABLE,
+      transparent: true,
+      opacity: 0.08,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
+  glow.scale.z = 0.08;
+  glow.position.z = -0.004;
+  group.add(glow);
+
+  const face = new THREE.Mesh(
+    new THREE.CircleGeometry(0.061, 64),
+    new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.DoubleSide,
+    }),
+  );
+  face.position.z = 0.016;
+  group.add(face);
+
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(0.067, 0.0036, 12, 96),
+    new THREE.MeshStandardMaterial({
+      color: WRIST_MIC_UNAVAILABLE,
+      emissive: WRIST_MIC_UNAVAILABLE,
+      emissiveIntensity: 0.7,
+      transparent: true,
+      opacity: 0.9,
+      roughness: 0.32,
+      metalness: 0.1,
+    }),
+  );
+  ring.position.z = 0.02;
+  group.add(ring);
+
+  const hitTarget = new THREE.Mesh(
+    new THREE.BoxGeometry(0.21, 0.16, 0.09),
+    new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    }),
+  );
+  hitTarget.name = "wrist-mic-hit-target";
+  hitTarget.position.z = 0.02;
+  group.add(hitTarget);
+
+  const control: WristMicControl = {
+    group,
+    base,
+    face,
+    ring,
+    glow,
+    hitTarget,
+    canvas,
+    context,
+    texture,
+    raycaster: new THREE.Raycaster(),
+    tempMatrix: new THREE.Matrix4(),
+    tempPosition: new THREE.Vector3(),
+    tempQuaternion: new THREE.Quaternion(),
+    tempScale: new THREE.Vector3(),
+    tempVector: new THREE.Vector3(),
+    tempVectorB: new THREE.Vector3(),
+    visualState: "",
+    pressPulseUntil: 0,
+  };
+  drawWristMicFace(control, false, false);
+  return control;
+}
+
+function drawWristMicFace(control: WristMicControl, micAvailable: boolean, micActive: boolean) {
+  const { canvas, context, texture } = control;
+  const accent = micAvailable ? (micActive ? "#5df2b6" : "#7dd3fc") : "#8c9aaa";
+  const status = micAvailable ? (micActive ? "LIVE" : "TAP") : "SETUP";
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const background = context.createRadialGradient(210, 164, 28, 256, 256, 246);
+  background.addColorStop(0, micActive ? "rgba(93, 242, 182, 0.34)" : "rgba(125, 211, 252, 0.18)");
+  background.addColorStop(0.48, "rgba(15, 34, 50, 0.94)");
+  background.addColorStop(1, "rgba(3, 10, 18, 0.98)");
+  context.fillStyle = background;
+  context.beginPath();
+  context.arc(256, 256, 240, 0, Math.PI * 2);
+  context.fill();
+
+  context.strokeStyle = "rgba(255, 255, 255, 0.34)";
+  context.lineWidth = 4;
+  context.beginPath();
+  context.arc(256, 256, 222, Math.PI * 1.18, Math.PI * 1.48);
+  context.stroke();
+
+  context.strokeStyle = "rgba(238, 250, 255, 0.18)";
+  context.lineWidth = 8;
+  context.beginPath();
+  context.arc(256, 256, 226, 0, Math.PI * 2);
+  context.stroke();
+
+  context.shadowColor = accent;
+  context.shadowBlur = micActive ? 24 : 14;
+  context.fillStyle = accent;
+  context.beginPath();
+  context.arc(380, 138, 22, 0, Math.PI * 2);
+  context.fill();
+  context.shadowBlur = 0;
+
+  context.strokeStyle = accent;
+  context.lineWidth = 18;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  roundRect(context, 214, 116, 84, 130, 40);
+  context.stroke();
+
+  context.strokeStyle = "rgba(241, 250, 255, 0.86)";
+  context.lineWidth = 10;
+  context.beginPath();
+  context.moveTo(256, 136);
+  context.lineTo(256, 224);
+  context.stroke();
+
+  context.strokeStyle = accent;
+  context.lineWidth = 18;
+  context.beginPath();
+  context.moveTo(176, 214);
+  context.bezierCurveTo(176, 300, 336, 300, 336, 214);
+  context.stroke();
+
+  context.beginPath();
+  context.moveTo(256, 302);
+  context.lineTo(256, 350);
+  context.moveTo(218, 356);
+  context.lineTo(294, 356);
+  context.stroke();
+
+  context.fillStyle = "rgba(255, 255, 255, 0.08)";
+  context.beginPath();
+  context.arc(256, 256, 154, 0, Math.PI * 2);
+  context.fill();
+
+  context.textAlign = "center";
+  context.fillStyle = accent;
+  context.font = "900 54px Inter, system-ui, sans-serif";
+  context.fillText(status, 256, 444);
+
+  context.fillStyle = "rgba(236, 248, 255, 0.74)";
+  context.font = "700 24px Inter, system-ui, sans-serif";
+  context.fillText("VOICE", 256, 480);
+  texture.needsUpdate = true;
+}
+
+function updateWristMicVisual(
+  control: WristMicControl,
+  micAvailable: boolean,
+  micActive: boolean,
+  elapsed: number,
+) {
+  const stateKey = `${micAvailable ? "available" : "unavailable"}-${micActive ? "on" : "off"}`;
+  if (control.visualState !== stateKey) {
+    control.visualState = stateKey;
+    drawWristMicFace(control, micAvailable, micActive);
+  }
+
+  const color = micAvailable ? (micActive ? WRIST_MIC_ON : WRIST_MIC_OFF) : WRIST_MIC_UNAVAILABLE;
+  const pulse = micActive ? Math.max(0, Math.sin(elapsed * 5.2)) : 0;
+  const pressPulse = performance.now() < control.pressPulseUntil ? 1 : 0;
+  control.ring.material.color.setHex(color);
+  control.ring.material.emissive.setHex(color);
+  control.ring.material.emissiveIntensity = micAvailable ? 0.7 + pulse * 0.42 + pressPulse * 0.8 : 0.38;
+  control.ring.material.opacity = micAvailable ? 0.88 + pulse * 0.1 : 0.52;
+  control.ring.scale.setScalar(1 + pulse * 0.055 + pressPulse * 0.12);
+
+  control.glow.material.color.setHex(color);
+  control.glow.material.opacity = micAvailable ? (micActive ? 0.17 + pulse * 0.12 : 0.08 + pressPulse * 0.14) : 0.035;
+  control.glow.scale.set(1 + pulse * 0.18 + pressPulse * 0.26, 1 + pulse * 0.18 + pressPulse * 0.26, 0.08);
+
+  control.base.material.emissive.setHex(color);
+  control.base.material.emissiveIntensity = micAvailable ? 0.12 + pulse * 0.12 + pressPulse * 0.32 : 0.04;
+  control.face.material.opacity = micAvailable ? 1 : 0.7;
+}
+
+function updateWristMicPlacement(runtime: StageRuntime, activeXrSession: boolean) {
+  const control = runtime.wristMic;
+  runtime.camera.updateMatrixWorld(true);
+  if (activeXrSession) {
+    const wristJoint = runtime.leftHand.visible ? runtime.leftHand.joints?.wrist : undefined;
+    const anchor = wristJoint ?? (runtime.leftGrip.visible ? runtime.leftGrip : runtime.leftController);
+    const hasTrackedAnchor = Boolean(wristJoint || runtime.leftGrip.visible || runtime.leftController.visible);
+
+    if (hasTrackedAnchor) {
+      anchor.updateMatrixWorld(true);
+      control.tempVector.set(
+        wristJoint ? 0.018 : -0.055,
+        wristJoint ? 0.018 : -0.035,
+        wristJoint ? -0.026 : -0.075,
+      );
+      control.group.position.copy(control.tempVector).applyMatrix4(anchor.matrixWorld);
+      runtime.camera.getWorldPosition(control.tempVectorB);
+      control.group.lookAt(control.tempVectorB);
+      control.group.scale.setScalar(wristJoint ? 0.34 : 0.38);
+      control.group.visible = true;
+      return;
+    }
+
+    control.tempVector.set(-0.34, -0.18, -0.72);
+    control.group.position.copy(control.tempVector).applyMatrix4(runtime.camera.matrixWorld);
+    runtime.camera.getWorldQuaternion(control.group.quaternion);
+    control.group.scale.setScalar(0.36);
+    control.group.visible = true;
+    return;
+  }
+  control.group.visible = true;
+
+  const narrowPreview = runtime.camera.aspect < 0.75;
+  control.tempVector.set(
+    narrowPreview ? -0.035 : -0.38,
+    narrowPreview ? -0.12 : -0.08,
+    narrowPreview ? -0.72 : -0.82,
+  );
+  control.group.position.copy(control.tempVector).applyMatrix4(runtime.camera.matrixWorld);
+  runtime.camera.getWorldQuaternion(control.group.quaternion);
+  control.group.scale.setScalar(narrowPreview ? 0.42 : 0.36);
+}
+
+function sourceTouchesWristMic(control: WristMicControl, source: THREE.Object3D, radius = WRIST_MIC_TOUCH_RADIUS) {
+  source.updateMatrixWorld(true);
+  control.hitTarget.updateMatrixWorld(true);
+  source.getWorldPosition(control.tempVector);
+  control.hitTarget.getWorldPosition(control.tempVectorB);
+  return control.tempVector.distanceTo(control.tempVectorB) <= radius;
+}
+
+function sourceRayHitsWristMic(control: WristMicControl, source: THREE.Object3D) {
+  source.updateMatrixWorld(true);
+  control.tempMatrix.identity().extractRotation(source.matrixWorld);
+  control.raycaster.ray.origin.setFromMatrixPosition(source.matrixWorld);
+  control.raycaster.ray.direction.set(0, 0, -1).applyMatrix4(control.tempMatrix).normalize();
+  control.raycaster.near = 0;
+  control.raycaster.far = WRIST_MIC_RAY_DISTANCE;
+  return control.raycaster.intersectObject(control.hitTarget, false).length > 0;
+}
+
+function handTouchesWristMic(control: WristMicControl, hand: XRHandSpaceLike) {
+  const indexTip =
+    hand.joints?.["index-finger-tip"] ??
+    hand.joints?.["index-finger-phalanx-distal"] ??
+    hand.joints?.["index-finger-phalanx-intermediate"];
+  return indexTip ? sourceTouchesWristMic(control, indexTip, WRIST_MIC_TOUCH_RADIUS) : sourceTouchesWristMic(control, hand);
+}
+
+function affordanceColor(kind: SpatialAffordanceKind) {
+  switch (kind) {
+    case "seat":
+      return 0x5df2b6;
+    case "table":
+      return 0xffc46b;
+    case "floor":
+      return 0x7dd3fc;
+    default:
+      return 0xff8068;
+  }
+}
+
+function createAffordanceDebugVisuals(): AffordanceDebugVisuals {
+  const group = new THREE.Group();
+  group.name = "spatial-affordance-debug";
+  group.visible = false;
+  const markers = Array.from({ length: AFFORDANCE_DEBUG_MAX_MARKERS }, (_, index) => {
+    const marker = new THREE.Mesh(
+      new THREE.RingGeometry(0.18, 0.2, 64),
+      new THREE.MeshBasicMaterial({
+        color: 0x7dd3fc,
+        transparent: true,
+        opacity: 0.5,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    marker.name = `spatial-affordance-marker-${index}`;
+    marker.rotation.x = -Math.PI / 2;
+    marker.renderOrder = 13;
+    marker.visible = false;
+    group.add(marker);
+    return marker;
+  });
+  return { group, markers };
+}
+
+function createAvatarPlacementState(): AvatarPlacementState {
+  const reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.24, 0.265, 96),
+    new THREE.MeshBasicMaterial({
+      color: 0x5df2b6,
+      transparent: true,
+      opacity: 0.78,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    }),
+  );
+  reticle.name = "yuki-placement-reticle";
+  reticle.rotation.x = -Math.PI / 2;
+  reticle.renderOrder = 14;
+  reticle.visible = false;
+
+  return {
+    hasUserPlacement: false,
+    anchorPosition: new THREE.Vector3(),
+    floorY: 0,
+    source: null,
+    affordanceKind: null,
+    affordanceId: null,
+    reticle,
+    floorPlane: new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    ray: new THREE.Ray(),
+    origin: new THREE.Vector3(),
+    direction: new THREE.Vector3(),
+    target: new THREE.Vector3(),
+    fallbackForward: new THREE.Vector3(0, 0, -1),
+    placedAt: 0,
+  };
+}
+
+function resolveAvatarPlacementTarget(
+  placement: AvatarPlacementState,
+  origin: THREE.Vector3,
+  direction: THREE.Vector3,
+) {
+  placement.direction.copy(direction);
+  if (placement.direction.lengthSq() < 0.0001) {
+    placement.direction.set(0, -0.24, -1);
+  }
+  placement.direction.normalize();
+  placement.floorPlane.setComponents(0, 1, 0, 0);
+  placement.ray.set(origin, placement.direction);
+
+  const floorHit = placement.ray.intersectPlane(placement.floorPlane, placement.target);
+  const hitDistance = floorHit ? floorHit.distanceTo(origin) : Number.POSITIVE_INFINITY;
+  if (floorHit && hitDistance >= 0.35 && hitDistance <= AVATAR_PLACEMENT_MAX_DISTANCE) {
+    return placement.target.clone();
+  }
+
+  placement.fallbackForward.copy(placement.direction);
+  placement.fallbackForward.y = 0;
+  if (placement.fallbackForward.lengthSq() < 0.0001) {
+    placement.fallbackForward.set(0, 0, -1);
+  }
+  placement.fallbackForward.normalize();
+  return placement.target
+    .copy(origin)
+    .addScaledVector(placement.fallbackForward, AVATAR_PLACEMENT_DEFAULT_DISTANCE)
+    .setY(0)
+    .clone();
+}
+
+function resolveAffordancePlacementTarget(
+  runtime: StageRuntime,
+  origin: THREE.Vector3,
+  direction: THREE.Vector3,
+) {
+  const targeted = runtime.spatialAffordances.nearestRayHit(origin, direction);
+  if (targeted && targeted.kind !== "blocked") {
+    return targeted;
+  }
+  return null;
+}
+
+function applyAvatarPlacement(
+  runtime: StageRuntime,
+  target: THREE.Vector3,
+  options: {
+    source?: AvatarPlacementState["source"];
+    affordance?: SpatialAffordance | null;
+  } = {},
+) {
+  const placement = runtime.avatarPlacement;
+  placement.hasUserPlacement = true;
+  placement.anchorPosition.copy(target);
+  placement.floorY = target.y;
+  placement.source = options.source ?? "manual";
+  placement.affordanceKind = options.affordance?.kind ?? null;
+  placement.affordanceId = options.affordance?.id ?? null;
+  placement.placedAt = performance.now();
+  placement.reticle.position.set(target.x, target.y + AVATAR_PLACEMENT_RETICLE_LIFT, target.z);
+  placement.reticle.visible = true;
+  runtime.spatialAffordances.observeSurface(
+    {
+      id: `manual:${placement.source}:${target.x.toFixed(2)}:${target.y.toFixed(2)}:${target.z.toFixed(2)}`,
+      center: target,
+      normal: new THREE.Vector3(0, 1, 0),
+      width: options.affordance?.size.x ?? 0.72,
+      depth: options.affordance?.size.z ?? 0.72,
+      source: "manual",
+      timestamp: performance.now() / 1000,
+      confidence: options.source === "autonomous" ? 0.82 : 0.74,
+      label: options.affordance?.label ?? options.affordance?.kind ?? "manual placement",
+    },
+    0,
+  );
+}
+
+function placeAvatarFromCamera(runtime: StageRuntime) {
+  runtime.camera.updateMatrixWorld(true);
+  runtime.camera.getWorldPosition(runtime.avatarPlacement.origin);
+  runtime.camera.getWorldDirection(runtime.avatarPlacement.direction);
+  const affordance = resolveAffordancePlacementTarget(
+    runtime,
+    runtime.avatarPlacement.origin,
+    runtime.avatarPlacement.direction,
+  );
+  const target = affordance?.center.clone() ?? resolveAvatarPlacementTarget(
+    runtime.avatarPlacement,
+    runtime.avatarPlacement.origin,
+    runtime.avatarPlacement.direction,
+  );
+  applyAvatarPlacement(runtime, target, { source: "manual", affordance });
+  return target;
+}
+
+function placeAvatarFromSource(runtime: StageRuntime, source: THREE.Object3D) {
+  source.updateMatrixWorld(true);
+  runtime.avatarPlacement.origin.setFromMatrixPosition(source.matrixWorld);
+  runtime.avatarPlacement.direction.set(0, 0, -1).transformDirection(source.matrixWorld);
+  const affordance = resolveAffordancePlacementTarget(
+    runtime,
+    runtime.avatarPlacement.origin,
+    runtime.avatarPlacement.direction,
+  );
+  const target = affordance?.center.clone() ?? resolveAvatarPlacementTarget(
+    runtime.avatarPlacement,
+    runtime.avatarPlacement.origin,
+    runtime.avatarPlacement.direction,
+  );
+  applyAvatarPlacement(runtime, target, { source: "manual", affordance });
+  return target;
+}
+
+function placementSummary(target: THREE.Vector3, affordance?: SpatialAffordance | null) {
+  const surface = affordance?.kind && affordance.kind !== "blocked" ? ` on ${affordance.kind}` : "";
+  return `Yuki placed${surface} ${target.x.toFixed(1)}m x, ${Math.abs(target.z).toFixed(1)}m from stage origin.`;
+}
+
+function updateAffordanceDebugVisuals(runtime: StageRuntime) {
+  const candidates = runtime.spatialAffordances.list().slice(0, runtime.affordanceDebug.markers.length);
+  runtime.affordanceDebug.group.visible = stageDebugEnabled();
+  runtime.affordanceDebug.markers.forEach((marker, index) => {
+    const candidate = candidates[index];
+    if (!candidate || candidate.kind === "blocked") {
+      marker.visible = false;
+      return;
+    }
+    marker.visible = true;
+    marker.position.set(candidate.center.x, candidate.center.y + 0.016, candidate.center.z);
+    marker.scale.set(
+      THREE.MathUtils.clamp(candidate.size.x / 0.42, 0.55, 3.2),
+      THREE.MathUtils.clamp(candidate.size.z / 0.42, 0.55, 3.2),
+      1,
+    );
+    marker.material.color.setHex(affordanceColor(candidate.kind));
+    marker.material.opacity = THREE.MathUtils.clamp(0.18 + candidate.stability * 0.58, 0.18, 0.78);
+  });
+}
+
+function observeDetectedXrPlanes(runtime: StageRuntime, frame: XRFrame | undefined, elapsed: number) {
+  const detectedPlanes = (frame as XRFrameWithDetectedPlanes | undefined)?.detectedPlanes;
+  if (!detectedPlanes?.size) {
+    return;
+  }
+
+  const referenceSpace = (
+    runtime.renderer.xr as THREE.WebXRManager & {
+      getReferenceSpace?: () => XRReferenceSpace | null;
+    }
+  ).getReferenceSpace?.();
+  if (!referenceSpace) {
+    return;
+  }
+
+  detectedPlanes.forEach((plane) => {
+    if (!plane.planeSpace || !plane.polygon || plane.polygon.length < 3) {
+      return;
+    }
+    const pose = frame?.getPose(plane.planeSpace, referenceSpace);
+    if (!pose) {
+      return;
+    }
+
+    const matrix = new THREE.Matrix4().fromArray(pose.transform.matrix);
+    const bounds = new THREE.Box3();
+    plane.polygon.forEach((point) => {
+      bounds.expandByPoint(new THREE.Vector3(point.x, point.y, point.z).applyMatrix4(matrix));
+    });
+    if (bounds.isEmpty()) {
+      return;
+    }
+
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    bounds.getCenter(center);
+    bounds.getSize(size);
+    const normal = new THREE.Vector3(0, 1, 0).transformDirection(matrix);
+    if (normal.y < 0) {
+      normal.multiplyScalar(-1);
+    }
+
+    const observation: SpatialSurfaceObservation = {
+      id: plane.lastChangedTime
+        ? `xr-plane:${plane.lastChangedTime.toFixed(0)}`
+        : `xr-plane:${center.x.toFixed(1)}:${center.y.toFixed(1)}:${center.z.toFixed(1)}`,
+      center,
+      normal,
+      width: Math.max(size.x, 0.02),
+      depth: Math.max(size.z, 0.02),
+      source: "xr-plane",
+      timestamp: elapsed,
+      confidence: plane.orientation === "horizontal" ? 0.88 : 0.64,
+      label: plane.semanticLabel,
+    };
+    runtime.spatialAffordances.observeSurface(observation, 0);
+  });
+}
+
+function updateSpatialAffordances(
+  runtime: StageRuntime,
+  frame: XRFrame | undefined,
+  elapsed: number,
+  desktopPreviewActive: boolean,
+) {
+  runtime.spatialAffordances.update(elapsed);
+  runtime.spatialAffordances.seedFloor(new THREE.Vector3(0, 0, 0), 3.4, 3.4, elapsed, "stage");
+  observeDetectedXrPlanes(runtime, frame, elapsed);
+
+  if (desktopPreviewActive && stageDebugEnabled()) {
+    runtime.spatialAffordances.observeSurface(
+      {
+        id: "synthetic:debug-seat",
+        center: new THREE.Vector3(0.44, 0.42, -1.12),
+        normal: new THREE.Vector3(0, 1, 0),
+        width: 0.78,
+        depth: 0.52,
+        source: "synthetic",
+        timestamp: elapsed,
+        confidence: 0.72,
+        label: "debug low surface",
+      },
+      0,
+    );
+  }
+
+  updateAffordanceDebugVisuals(runtime);
 }
 
 function disposeMaterial(material: THREE.Material | THREE.Material[]) {
@@ -284,8 +1144,21 @@ function wrapLines(context: CanvasRenderingContext2D, text: string, maxWidth: nu
   }
 
   const lines: string[] = [];
-  let current = words[0] ?? "";
-  for (const word of words.slice(1)) {
+  let current = "";
+  for (const rawWord of words) {
+    let word = rawWord;
+    while (context.measureText(word).width > maxWidth && word.length > 4) {
+      let cut = word.length - 1;
+      while (cut > 3 && context.measureText(`${word.slice(0, cut)}-`).width > maxWidth) {
+        cut -= 1;
+      }
+      lines.push(`${word.slice(0, Math.max(cut, 3))}-`);
+      word = word.slice(Math.max(cut, 3));
+    }
+    if (!current) {
+      current = word;
+      continue;
+    }
     const candidate = `${current} ${word}`;
     if (context.measureText(candidate).width <= maxWidth) {
       current = candidate;
@@ -294,8 +1167,43 @@ function wrapLines(context: CanvasRenderingContext2D, text: string, maxWidth: nu
     lines.push(current);
     current = word;
   }
-  lines.push(current);
+  if (current) {
+    lines.push(current);
+  }
   return lines;
+}
+
+function ellipsizeLine(context: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  const cleaned = text.trim();
+  if (context.measureText(cleaned).width <= maxWidth) {
+    return cleaned;
+  }
+
+  let candidate = cleaned;
+  while (candidate.length > 1 && context.measureText(`${candidate.trimEnd()}...`).width > maxWidth) {
+    candidate = candidate.slice(0, -1);
+  }
+  return `${candidate.trimEnd()}...`;
+}
+
+function drawWrappedText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  maxLines: number,
+  lineHeight: number,
+) {
+  const wrapped = wrapLines(context, text, maxWidth);
+  const lines = wrapped.slice(0, maxLines);
+  if (wrapped.length > maxLines && lines.length > 0) {
+    lines[lines.length - 1] = ellipsizeLine(context, lines[lines.length - 1], maxWidth);
+  }
+  lines.forEach((line, index) => {
+    context.fillText(line, x, y + index * lineHeight);
+  });
+  return lines.length;
 }
 
 function drawPanel(
@@ -320,44 +1228,647 @@ function drawPanel(
   context.clearRect(0, 0, width, height);
 
   const background = context.createLinearGradient(0, 0, width, height);
-  background.addColorStop(0, "rgba(6, 14, 24, 0.96)");
-  background.addColorStop(1, "rgba(11, 28, 42, 0.92)");
+  background.addColorStop(0, "rgba(252, 247, 255, 0.96)");
+  background.addColorStop(0.48, "rgba(238, 247, 255, 0.92)");
+  background.addColorStop(1, "rgba(218, 234, 255, 0.88)");
   context.fillStyle = background;
   roundRect(context, 20, 20, width - 40, height - 40, 36);
   context.fill();
 
-  context.strokeStyle = "rgba(175, 226, 255, 0.22)";
+  context.strokeStyle = "rgba(61, 126, 255, 0.2)";
   context.lineWidth = 3;
   roundRect(context, 20, 20, width - 40, height - 40, 36);
   context.stroke();
 
-  context.fillStyle = accent;
-  roundRect(context, 44, 48, 176, 42, 21);
+  context.fillStyle = "rgba(255, 255, 255, 0.52)";
+  roundRect(context, 36, 36, width - 72, height - 72, 28);
   context.fill();
 
-  context.fillStyle = "#06111d";
-  context.font = "600 22px Inter, system-ui, sans-serif";
-  context.fillText(eyebrow.toUpperCase(), 66, 76);
+  context.save();
+  roundRect(context, 38, 38, width - 76, height - 76, 26);
+  context.clip();
 
-  context.fillStyle = "#eefaff";
-  context.font = "700 40px Inter, system-ui, sans-serif";
+  context.fillStyle = accent;
+  roundRect(context, 44, 48, 190, 46, 23);
+  context.fill();
+
+  context.fillStyle = "#f9fcff";
+  context.font = "800 22px Inter, system-ui, sans-serif";
+  context.fillText(eyebrow.toUpperCase(), 66, 78);
+
+  context.fillStyle = "#08215f";
+  const titleLength = title.trim().length;
+  const titleFontSize = titleLength > 34 ? 34 : titleLength > 22 ? 38 : 44;
+  context.font = `800 ${titleFontSize}px Inter, system-ui, sans-serif`;
   const titleLines = wrapLines(context, title, width - 88).slice(0, 2);
+  if (titleLines.length > 1) {
+    titleLines[1] = ellipsizeLine(context, titleLines[1], width - 88);
+  }
   titleLines.forEach((line, index) => {
-    context.fillText(line, 44, 146 + index * 46);
+    context.fillText(line, 44, 152 + index * (titleFontSize + 8));
   });
 
-  context.fillStyle = "rgba(239, 247, 251, 0.86)";
+  context.fillStyle = "rgba(29, 57, 112, 0.84)";
   const bodyLength = body.trim().length;
-  const bodyFontSize = bodyLength > 300 ? 24 : bodyLength > 210 ? 26 : 28;
-  const lineHeight = bodyLength > 300 ? 32 : bodyLength > 210 ? 34 : 36;
-  const maxLines = bodyLength > 300 ? 10 : bodyLength > 210 ? 9 : 8;
+  const bodyFontSize = bodyLength > 420 ? 20 : bodyLength > 300 ? 22 : bodyLength > 210 ? 24 : 27;
+  const lineHeight = bodyFontSize + 7;
+  const maxLines = Math.max(5, Math.floor((height - 342) / lineHeight));
   context.font = `500 ${bodyFontSize}px Inter, system-ui, sans-serif`;
-  const lines = wrapLines(context, body, width - 88).slice(0, maxLines);
-  lines.forEach((line, index) => {
-    context.fillText(line, 44, 250 + index * lineHeight);
+  drawWrappedText(context, body, 44, 250, width - 88, maxLines, lineHeight);
+
+  context.fillStyle = "rgba(43, 111, 255, 0.76)";
+  context.font = "800 22px Inter, system-ui, sans-serif";
+  context.fillText(
+    ellipsizeLine(context, "Select: expand / compact / hide", width - 88),
+    44,
+    height - 72,
+  );
+  context.fillText(
+    ellipsizeLine(context, "Squeeze: move left / front / right", width - 88),
+    44,
+    height - 42,
+  );
+
+  context.restore();
+  texture.needsUpdate = true;
+}
+
+function drawChatPanel(
+  panel: PanelCard,
+  messages: HermesChatMessage[],
+  {
+    tone,
+    compact,
+    scrollOffset = 0,
+  }: {
+    tone: StageTone;
+    compact: boolean;
+    scrollOffset?: number;
+  },
+) {
+  const { canvas, context, texture } = panel;
+  const width = canvas.width;
+  const height = canvas.height;
+  const accent = `#${toneColor(tone).toString(16).padStart(6, "0")}`;
+
+  context.clearRect(0, 0, width, height);
+
+  const background = context.createLinearGradient(0, 0, width, height);
+  background.addColorStop(0, "rgba(255, 252, 244, 0.98)");
+  background.addColorStop(0.58, "rgba(240, 249, 255, 0.95)");
+  background.addColorStop(1, "rgba(225, 240, 255, 0.92)");
+  context.fillStyle = background;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.fill();
+
+  context.strokeStyle = "rgba(43, 111, 255, 0.22)";
+  context.lineWidth = 3;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.stroke();
+
+  context.fillStyle = "rgba(255, 255, 255, 0.58)";
+  roundRect(context, 36, 36, width - 72, height - 72, 30);
+  context.fill();
+
+  context.save();
+  roundRect(context, 38, 38, width - 76, height - 76, 28);
+  context.clip();
+
+  context.fillStyle = accent;
+  roundRect(context, 48, 48, 232, 48, 24);
+  context.fill();
+  context.fillStyle = "#f9fcff";
+  context.font = "900 22px Inter, system-ui, sans-serif";
+  context.fillText("HERMES CHAT", 70, 80);
+
+  context.fillStyle = "#08215f";
+  context.font = `900 ${compact ? 37 : 42}px Inter, system-ui, sans-serif`;
+  context.fillText(ellipsizeLine(context, "Hermes conversation", width - 96), 48, 150);
+
+  const visibleCount = compact ? 2 : 4;
+  const maxScroll = Math.max(0, messages.length - visibleCount);
+  const clampedScroll = THREE.MathUtils.clamp(scrollOffset, 0, maxScroll);
+  const startIndex = Math.max(0, messages.length - visibleCount - clampedScroll);
+  const visibleMessages = messages.slice(startIndex, startIndex + visibleCount);
+  let cursorY = compact ? 218 : 202;
+  const maxBubbleWidth = compact ? width - 118 : width - 128;
+  visibleMessages.forEach((message) => {
+    const isUser = message.speaker === "user";
+    const isWorker = message.speaker === "worker";
+    const bubbleX = isUser ? width - maxBubbleWidth - 52 : 52;
+    const bubbleColor = isUser
+      ? "rgba(43, 111, 255, 0.13)"
+      : isWorker
+        ? "rgba(255, 177, 76, 0.18)"
+        : "rgba(90, 240, 186, 0.16)";
+    const textColor = "#173162";
+    const labelColor = isUser ? "#245dd8" : isWorker ? "#b45f00" : "#087f62";
+    const maxLines = compact ? 2 : 3;
+    const fontSize = compact ? 24 : 25;
+    const lineHeight = fontSize + 8;
+
+    context.font = `700 20px Inter, system-ui, sans-serif`;
+    context.fillStyle = labelColor;
+    const label = ellipsizeLine(context, message.label.toUpperCase(), maxBubbleWidth - 40);
+    const bodyLines = wrapLines(context, message.text, maxBubbleWidth - 40).slice(0, maxLines);
+    if (bodyLines.length === maxLines) {
+      bodyLines[bodyLines.length - 1] = ellipsizeLine(context, bodyLines[bodyLines.length - 1], maxBubbleWidth - 40);
+    }
+    const bubbleHeight = 58 + Math.max(1, bodyLines.length) * lineHeight;
+
+    if (cursorY + bubbleHeight > height - 126) {
+      return;
+    }
+
+    context.fillStyle = bubbleColor;
+    roundRect(context, bubbleX, cursorY, maxBubbleWidth, bubbleHeight, 28);
+    context.fill();
+    context.strokeStyle = isUser ? "rgba(43, 111, 255, 0.18)" : "rgba(22, 163, 121, 0.16)";
+    context.lineWidth = 2;
+    roundRect(context, bubbleX, cursorY, maxBubbleWidth, bubbleHeight, 28);
+    context.stroke();
+
+    context.fillStyle = labelColor;
+    context.font = "800 19px Inter, system-ui, sans-serif";
+    context.fillText(label, bubbleX + 22, cursorY + 34);
+
+    context.fillStyle = textColor;
+    context.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
+    bodyLines.forEach((line, index) => {
+      context.fillText(line, bubbleX + 22, cursorY + 70 + index * lineHeight);
+    });
+
+    cursorY += bubbleHeight + 16;
   });
 
+  context.fillStyle = "rgba(43, 111, 255, 0.76)";
+  context.font = "900 22px Inter, system-ui, sans-serif";
+  const footer = compact
+    ? "Left stick chooses panel  •  right stick scrolls"
+    : `Chat ${startIndex + 1}-${Math.min(messages.length, startIndex + visibleCount)} / ${messages.length}: right stick scrolls`;
+  context.fillText(ellipsizeLine(context, footer, width - 96), 48, height - 70);
+  context.fillText(
+    ellipsizeLine(context, "Pointer select still works. Empty select: compact/hide/show", width - 96),
+    48,
+    height - 40,
+  );
+  context.restore();
   texture.needsUpdate = true;
+}
+
+function sessionDisplayName(session: CodingSessionSnapshot | undefined) {
+  return session?.workerLabel ?? session?.title ?? "No active session";
+}
+
+function buildSessionStreamLines(session: CodingSessionSnapshot | undefined): string[] {
+  if (!session) {
+    return [
+      "No Claude/Codex session is active yet.",
+      "Launch a worker and its command, terminal screen, and status stream will appear here.",
+    ];
+  }
+
+  const lines = [
+    `$ ${session.command ?? "Hermes-managed session"}`,
+    `repo: ${session.repoPath ?? "current project"} | status: ${normalizeWorkerStatus(session)}`,
+  ];
+  const statusLines = [
+    session.pendingQuestion ? `question: ${session.pendingQuestion}` : null,
+    session.blockedReason ? `blocked: ${session.blockedReason}` : null,
+    session.statusText ? `status: ${session.statusText}` : null,
+    session.managerSummary ? `summary: ${session.managerSummary}` : null,
+    session.lastUpdate ? `update: ${session.lastUpdate}` : null,
+  ].filter((line): line is string => Boolean(line));
+
+  if (statusLines.length > 0) {
+    lines.push("", ...statusLines);
+  }
+
+  const screenLines = session.screenText
+    ?.split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .slice(-28);
+  const outputTail = session.outputTail.map((line) => line.trimEnd()).filter(Boolean).slice(-28);
+  const streamLines = screenLines?.length ? screenLines : outputTail;
+  if (streamLines.length > 0) {
+    lines.push("", "live stream:", ...streamLines);
+  }
+
+  return lines;
+}
+
+function drawTerminalPanel(
+  panel: PanelCard,
+  session: CodingSessionSnapshot | undefined,
+  {
+    tone,
+    scrollOffset,
+    focusLabel,
+  }: {
+    tone: StageTone;
+    scrollOffset: number;
+    focusLabel: string;
+  },
+) {
+  const { canvas, context, texture } = panel;
+  const width = canvas.width;
+  const height = canvas.height;
+  const accent = `#${toneColor(tone).toString(16).padStart(6, "0")}`;
+  const title = sessionDisplayName(session);
+  const subtitle = compactText(session?.taskTitle ?? session?.intent ?? session?.statusText, "Claude/Codex session stream", 82);
+  const lines = buildSessionStreamLines(session);
+
+  context.clearRect(0, 0, width, height);
+
+  const background = context.createLinearGradient(0, 0, width, height);
+  background.addColorStop(0, "rgba(5, 12, 20, 0.99)");
+  background.addColorStop(1, "rgba(9, 21, 34, 0.97)");
+  context.fillStyle = background;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.fill();
+
+  context.strokeStyle = "rgba(125, 211, 252, 0.32)";
+  context.lineWidth = 3;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.stroke();
+
+  context.save();
+  roundRect(context, 38, 38, width - 76, height - 76, 28);
+  context.clip();
+
+  context.fillStyle = "rgba(255, 255, 255, 0.05)";
+  roundRect(context, 38, 38, width - 76, height - 76, 28);
+  context.fill();
+
+  context.fillStyle = accent;
+  roundRect(context, 52, 52, 198, 46, 23);
+  context.fill();
+  context.fillStyle = "#f9fcff";
+  context.font = "900 22px Inter, system-ui, sans-serif";
+  context.fillText("HERMES WORK", 72, 82);
+
+  context.fillStyle = "#e8f8ff";
+  context.font = "900 42px Inter, system-ui, sans-serif";
+  context.fillText(ellipsizeLine(context, title, width - 104), 52, 154);
+
+  context.fillStyle = "rgba(198, 229, 247, 0.84)";
+  context.font = "700 23px Inter, system-ui, sans-serif";
+  context.fillText(ellipsizeLine(context, subtitle, width - 104), 52, 196);
+
+  const terminalTop = 226;
+  const terminalBottom = height - 112;
+  const lineHeight = 24;
+  const maxLines = Math.floor((terminalBottom - terminalTop) / lineHeight);
+  context.font = "700 18px SF Mono, Menlo, Consolas, monospace";
+  const displayLines = lines.flatMap((line) => {
+    if (!line) {
+      return [""];
+    }
+    return wrapLines(context, line, width - 128);
+  });
+  const clampedScroll = THREE.MathUtils.clamp(scrollOffset, 0, Math.max(0, displayLines.length - maxLines));
+  const end = Math.max(0, displayLines.length - clampedScroll);
+  const start = Math.max(0, end - maxLines);
+  const visibleLines = displayLines.slice(start, end);
+
+  context.fillStyle = "rgba(0, 0, 0, 0.42)";
+  roundRect(context, 48, terminalTop - 14, width - 96, terminalBottom - terminalTop + 28, 22);
+  context.fill();
+
+  visibleLines.forEach((line, index) => {
+    const isMeta = line.startsWith("$") || line.startsWith("repo:") || line.endsWith(":");
+    context.fillStyle = isMeta ? "#7dffca" : "rgba(228, 242, 252, 0.92)";
+    context.fillText(ellipsizeLine(context, line, width - 128), 66, terminalTop + index * lineHeight);
+  });
+
+  context.fillStyle = "rgba(125, 211, 252, 0.84)";
+  context.font = "900 21px Inter, system-ui, sans-serif";
+  const scrollLabel =
+    displayLines.length > maxLines ? `lines ${start + 1}-${end} / ${displayLines.length}` : `${displayLines.length} lines`;
+  context.fillText(
+    ellipsizeLine(
+      context,
+      `${focusLabel}  •  left stick focus  •  right stick scroll  •  ${scrollLabel}`,
+      width - 104,
+    ),
+    52,
+    height - 68,
+  );
+  context.fillText(
+    ellipsizeLine(context, "Pointer select/squeeze still pages this panel. Empty select changes deck", width - 104),
+    52,
+    height - 38,
+  );
+
+  context.restore();
+  texture.needsUpdate = true;
+}
+
+function drawActivityPanel(
+  panel: PanelCard,
+  {
+    leadSession,
+    sessions,
+    activityEvents,
+    tone,
+  }: {
+    leadSession: CodingSessionSnapshot | undefined;
+    sessions: CodingSessionSnapshot[];
+    activityEvents: AgentWireEvent[];
+    tone: StageTone;
+  },
+) {
+  const { canvas, context, texture } = panel;
+  const width = canvas.width;
+  const height = canvas.height;
+  const accent = `#${toneColor(tone).toString(16).padStart(6, "0")}`;
+  const rows = buildActivityRows(leadSession, sessions, activityEvents);
+  const liveCount = sessions.filter((session) => session.status === "running").length;
+
+  context.clearRect(0, 0, width, height);
+
+  const background = context.createLinearGradient(0, 0, width, height);
+  background.addColorStop(0, "rgba(7, 18, 29, 0.98)");
+  background.addColorStop(0.64, "rgba(13, 31, 45, 0.96)");
+  background.addColorStop(1, "rgba(20, 39, 52, 0.94)");
+  context.fillStyle = background;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.fill();
+
+  context.strokeStyle = "rgba(125, 211, 252, 0.28)";
+  context.lineWidth = 3;
+  roundRect(context, 20, 20, width - 40, height - 40, 38);
+  context.stroke();
+
+  context.save();
+  roundRect(context, 38, 38, width - 76, height - 76, 28);
+  context.clip();
+
+  context.fillStyle = accent;
+  roundRect(context, 48, 48, 222, 48, 24);
+  context.fill();
+  context.fillStyle = "#f9fcff";
+  context.font = "900 21px Inter, system-ui, sans-serif";
+  context.fillText("AGENT ACTIVITY", 68, 80);
+
+  context.fillStyle = "#e8f8ff";
+  context.font = "900 37px Inter, system-ui, sans-serif";
+  context.fillText(
+    ellipsizeLine(context, `${liveCount} live / ${sessions.length} known`, width - 96),
+    48,
+    148,
+  );
+
+  context.fillStyle = "rgba(198, 229, 247, 0.82)";
+  context.font = "700 21px Inter, system-ui, sans-serif";
+  context.fillText(
+    ellipsizeLine(context, "Left stick chooses panel  •  right stick cycles focused worker", width - 96),
+    48,
+    184,
+  );
+
+  let cursorY = 218;
+  const rowHeight = 82;
+  const maxRows = Math.max(2, Math.floor((height - 320) / rowHeight));
+  const visibleRows = rows.slice(0, maxRows);
+  if (visibleRows.length === 0) {
+    context.fillStyle = "rgba(125, 211, 252, 0.12)";
+    roundRect(context, 48, cursorY, width - 96, 112, 24);
+    context.fill();
+    context.fillStyle = "#d9f2ff";
+    context.font = "800 24px Inter, system-ui, sans-serif";
+    context.fillText("No managed agents visible yet.", 68, cursorY + 42);
+    context.font = "600 21px Inter, system-ui, sans-serif";
+    drawWrappedText(
+      context,
+      "When Hermes opens Claude or Codex, this panel will show the worker label, command, status, and latest terminal evidence.",
+      68,
+      cursorY + 76,
+      width - 136,
+      2,
+      27,
+    );
+  } else {
+    visibleRows.forEach((row) => {
+      context.fillStyle = "rgba(255, 255, 255, 0.055)";
+      roundRect(context, 48, cursorY, width - 96, rowHeight - 10, 22);
+      context.fill();
+      context.strokeStyle = "rgba(125, 211, 252, 0.14)";
+      context.lineWidth = 2;
+      roundRect(context, 48, cursorY, width - 96, rowHeight - 10, 22);
+      context.stroke();
+
+      context.fillStyle = "#7dffca";
+      context.font = "900 21px Inter, system-ui, sans-serif";
+      context.fillText(ellipsizeLine(context, row.label, width - 136), 68, cursorY + 30);
+
+      context.fillStyle = "rgba(228, 242, 252, 0.9)";
+      context.font = "650 20px Inter, system-ui, sans-serif";
+      drawWrappedText(context, row.detail, 68, cursorY + 60, width - 136, 1, 25);
+      cursorY += rowHeight;
+    });
+  }
+
+  const newestEvent = activityEvents.find((event) => event.session_id || event.type.startsWith("terminal."));
+  const footer = newestEvent
+    ? `Newest event: ${agentActivityEventLine(newestEvent)}`
+    : "Use left stick for panel focus. Use right stick here for worker focus.";
+  context.fillStyle = "rgba(125, 211, 252, 0.84)";
+  context.font = "900 20px Inter, system-ui, sans-serif";
+  context.fillText(ellipsizeLine(context, footer, width - 96), 48, height - 70);
+  context.fillText(
+    ellipsizeLine(context, "Empty select: compact/hide/show. Empty squeeze: move left/front/right", width - 96),
+    48,
+    height - 40,
+  );
+
+  context.restore();
+  texture.needsUpdate = true;
+}
+
+function xrPanelFocusLabel(panel: XrPanelKey): string {
+  switch (panel) {
+    case "summary":
+      return "Hermes chat";
+    case "worker":
+      return "Worker stream";
+    case "status":
+      return "Agent activity";
+  }
+}
+
+function drawPanelFocusFrame(panel: PanelCard, selected: boolean, label: string) {
+  if (!selected) {
+    return;
+  }
+  const { canvas, context, texture } = panel;
+  const width = canvas.width;
+  const height = canvas.height;
+
+  context.save();
+  context.strokeStyle = "rgba(87, 240, 183, 0.95)";
+  context.lineWidth = 10;
+  roundRect(context, 24, 24, width - 48, height - 48, 38);
+  context.stroke();
+
+  context.fillStyle = "rgba(87, 240, 183, 0.96)";
+  roundRect(context, width - 278, 52, 226, 44, 22);
+  context.fill();
+  context.fillStyle = "#05222a";
+  context.font = "900 18px Inter, system-ui, sans-serif";
+  context.fillText(ellipsizeLine(context, label.toUpperCase(), 186), width - 252, 81);
+  context.restore();
+  texture.needsUpdate = true;
+}
+
+function panelGeometrySize(mesh: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>) {
+  const parameters = mesh.geometry.parameters as { width?: number; height?: number };
+  return {
+    width: parameters.width ?? 1,
+    height: parameters.height ?? 1,
+  };
+}
+
+function sourceRayHitXrPanel(runtime: StageRuntime, source: THREE.Object3D): XrPanelKey | null {
+  source.updateMatrixWorld(true);
+  const tempMatrix = new THREE.Matrix4().identity().extractRotation(source.matrixWorld);
+  const origin = new THREE.Vector3().setFromMatrixPosition(source.matrixWorld);
+  const direction = new THREE.Vector3(0, 0, -1).applyMatrix4(tempMatrix).normalize();
+  const inverseMatrix = new THREE.Matrix4();
+  const localOrigin = new THREE.Vector3();
+  const localDirection = new THREE.Vector3();
+  const localHit = new THREE.Vector3();
+  let closestKey: XrPanelKey | null = null;
+  let closestDistance = Number.POSITIVE_INFINITY;
+
+  for (const key of Object.keys(runtime.panels) as XrPanelKey[]) {
+    const panel = runtime.panels[key];
+    if (!panel.mesh.visible) {
+      continue;
+    }
+    panel.mesh.updateMatrixWorld(true);
+    inverseMatrix.copy(panel.mesh.matrixWorld).invert();
+    localOrigin.copy(origin).applyMatrix4(inverseMatrix);
+    localDirection.copy(direction).transformDirection(inverseMatrix);
+    if (Math.abs(localDirection.z) < 0.0001) {
+      continue;
+    }
+    const hitDistance = -localOrigin.z / localDirection.z;
+    if (hitDistance < 0 || hitDistance > closestDistance) {
+      continue;
+    }
+    localHit.copy(localOrigin).addScaledVector(localDirection, hitDistance);
+    const { width, height } = panelGeometrySize(panel.mesh);
+    if (
+      Math.abs(localHit.x) <= width / 2 + XR_UI_PANEL_RAY_MARGIN &&
+      Math.abs(localHit.y) <= height / 2 + XR_UI_PANEL_RAY_MARGIN
+    ) {
+      closestKey = key;
+      closestDistance = hitDistance;
+    }
+  }
+  return closestKey;
+}
+
+function sourceRayHitsXrPanel(runtime: StageRuntime, source: THREE.Object3D) {
+  return Boolean(sourceRayHitXrPanel(runtime, source));
+}
+
+function sourceTouchXrPanel(runtime: StageRuntime, source: THREE.Object3D): XrPanelKey | null {
+  source.updateMatrixWorld(true);
+  const worldPoint = new THREE.Vector3();
+  const localPoint = new THREE.Vector3();
+  const inverseMatrix = new THREE.Matrix4();
+  source.getWorldPosition(worldPoint);
+
+  for (const key of Object.keys(runtime.panels) as XrPanelKey[]) {
+    const panel = runtime.panels[key];
+    if (!panel.mesh.visible) {
+      continue;
+    }
+    panel.mesh.updateMatrixWorld(true);
+    inverseMatrix.copy(panel.mesh.matrixWorld).invert();
+    localPoint.copy(worldPoint).applyMatrix4(inverseMatrix);
+    const { width, height } = panelGeometrySize(panel.mesh);
+    if (
+      Math.abs(localPoint.x) <= width / 2 + XR_UI_PANEL_TOUCH_RADIUS &&
+      Math.abs(localPoint.y) <= height / 2 + XR_UI_PANEL_TOUCH_RADIUS &&
+      Math.abs(localPoint.z) <= XR_UI_PANEL_TOUCH_RADIUS
+    ) {
+      return key;
+    }
+  }
+  return null;
+}
+
+function sourceTouchesXrPanel(runtime: StageRuntime, source: THREE.Object3D) {
+  return Boolean(sourceTouchXrPanel(runtime, source));
+}
+
+function handTouchXrPanel(runtime: StageRuntime, hand: XRHandSpaceLike): XrPanelKey | null {
+  const indexTip =
+    hand.joints?.["index-finger-tip"] ??
+    hand.joints?.["index-finger-phalanx-distal"] ??
+    hand.joints?.["index-finger-phalanx-intermediate"];
+  return sourceTouchXrPanel(runtime, indexTip ?? hand);
+}
+
+function handTouchesXrPanel(runtime: StageRuntime, hand: XRHandSpaceLike) {
+  return Boolean(handTouchXrPanel(runtime, hand));
+}
+
+function controllerInputSource(controller: THREE.Object3D): XRInputSource | null {
+  return ((controller as XRControllerWithInputSource).userData.inputSource as XRInputSource | undefined) ?? null;
+}
+
+function bindControllerInputSource(controller: THREE.Group, removers: Array<() => void>) {
+  const eventTarget = controller as THREE.Object3D & {
+    addEventListener(type: string, listener: (event: unknown) => void): void;
+    removeEventListener(type: string, listener: (event: unknown) => void): void;
+  };
+  const connected = (event: unknown) => {
+    const inputSource = (event as { data?: XRInputSource }).data;
+    if (inputSource) {
+      (controller as XRControllerWithInputSource).userData.inputSource = inputSource;
+    }
+  };
+  const disconnected = () => {
+    delete (controller as XRControllerWithInputSource).userData.inputSource;
+  };
+  eventTarget.addEventListener("connected", connected);
+  eventTarget.addEventListener("disconnected", disconnected);
+  removers.push(() => {
+    eventTarget.removeEventListener("connected", connected);
+    eventTarget.removeEventListener("disconnected", disconnected);
+  });
+}
+
+function controllerForHand(runtime: StageRuntime, handedness: XRHandedness): THREE.Group {
+  const controllers = [runtime.leftController, runtime.rightController];
+  return (
+    controllers.find((controller) => controllerInputSource(controller)?.handedness === handedness) ??
+    (handedness === "left" ? runtime.leftController : runtime.rightController)
+  );
+}
+
+function bestGamepadAxisPair(gamepad: Gamepad | null | undefined): { x: number; y: number } | null {
+  const axes = gamepad?.axes;
+  if (!axes || axes.length < 2) {
+    return null;
+  }
+  let best: { x: number; y: number } | null = null;
+  let bestMagnitude = 0;
+  for (let index = 0; index < axes.length - 1; index += 2) {
+    const x = axes[index] ?? 0;
+    const y = axes[index + 1] ?? 0;
+    const magnitude = Math.abs(x) + Math.abs(y);
+    if (magnitude > bestMagnitude) {
+      best = { x, y };
+      bestMagnitude = magnitude;
+    }
+  }
+  return best;
 }
 
 function roundRect(
@@ -522,15 +2033,14 @@ function normalizeAvatarScene(root: THREE.Group, scene: THREE.Object3D) {
   bounds.getSize(size);
   bounds.getCenter(center);
 
-  const targetHeight = 1.16;
-  const scale = targetHeight / Math.max(size.y, 0.001);
+  const scale = AVATAR_TARGET_HEIGHT / Math.max(size.y, 0.001);
   scene.scale.setScalar(scale);
   scene.userData.basePresenceScale = scale;
 
   const scaledBounds = new THREE.Box3().setFromObject(scene);
   const scaledCenter = new THREE.Vector3();
   scaledBounds.getCenter(scaledCenter);
-  scene.position.set(-scaledCenter.x, -scaledBounds.min.y, -scaledCenter.z);
+  scene.position.set(-scaledCenter.x, -scaledBounds.min.y + AVATAR_BASE_FLOOR_CLEARANCE, -scaledCenter.z);
 }
 
 function prepareDesktopPreviewMaterials(scene: THREE.Object3D) {
@@ -643,10 +2153,18 @@ function captureAvatarRig(scene: THREE.Object3D, vrm?: VRM | null): AvatarRig | 
       leftUpperArm: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftUpperArm)),
       leftLowerArm: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftLowerArm)),
       leftHand: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftHand)),
+      leftUpperLeg: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftUpperLeg)),
+      leftLowerLeg: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftLowerLeg)),
+      leftFoot: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftFoot)),
+      leftToes: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.LeftToes)),
       rightShoulder: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightShoulder)),
       rightUpperArm: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightUpperArm)),
       rightLowerArm: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightLowerArm)),
       rightHand: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightHand)),
+      rightUpperLeg: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightUpperLeg)),
+      rightLowerLeg: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightLowerLeg)),
+      rightFoot: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightFoot)),
+      rightToes: toBone(vrm.humanoid.getRawBoneNode(VRMHumanBoneName.RightToes)),
       rest: new Map(),
     };
 
@@ -678,10 +2196,18 @@ function captureAvatarRig(scene: THREE.Object3D, vrm?: VRM | null): AvatarRig | 
     leftUpperArm: lookup.get("J_Bip_L_UpperArm"),
     leftLowerArm: lookup.get("J_Bip_L_LowerArm"),
     leftHand: lookup.get("J_Bip_L_Hand"),
+    leftUpperLeg: lookup.get("J_Bip_L_UpperLeg"),
+    leftLowerLeg: lookup.get("J_Bip_L_LowerLeg"),
+    leftFoot: lookup.get("J_Bip_L_Foot"),
+    leftToes: lookup.get("J_Bip_L_ToeBase"),
     rightShoulder: lookup.get("J_Bip_R_Shoulder"),
     rightUpperArm: lookup.get("J_Bip_R_UpperArm"),
     rightLowerArm: lookup.get("J_Bip_R_LowerArm"),
     rightHand: lookup.get("J_Bip_R_Hand"),
+    rightUpperLeg: lookup.get("J_Bip_R_UpperLeg"),
+    rightLowerLeg: lookup.get("J_Bip_R_LowerLeg"),
+    rightFoot: lookup.get("J_Bip_R_Foot"),
+    rightToes: lookup.get("J_Bip_R_ToeBase"),
     rest: new Map(),
   };
 
@@ -722,6 +2248,8 @@ function mapClipState(state: AnimationState): AvatarClipState {
       return "speaking";
     case "alert":
       return "alert";
+    case "sitting":
+      return "idle";
     default:
       return "idle";
   }
@@ -762,8 +2290,20 @@ async function loadPrototypeAnimationController(scene: THREE.Object3D) {
   } satisfies AvatarAnimationController;
 }
 
-function setAvatarClipState(controller: AvatarAnimationController, state: AvatarClipState) {
+function setAvatarClipState(
+  controller: AvatarAnimationController,
+  state: AvatarClipState,
+  clipTimeScale = 1,
+  crossFadeSeconds = 0.28,
+) {
+  const clampedTimeScale = THREE.MathUtils.clamp(clipTimeScale, 0.65, 1.35);
+  const clampedFadeSeconds = THREE.MathUtils.clamp(crossFadeSeconds, 0.08, 0.55);
+
   if (controller.activeState === state) {
+    const activeAction = controller.actions[state];
+    if (activeAction) {
+      activeAction.setEffectiveTimeScale(clampedTimeScale);
+    }
     return;
   }
 
@@ -777,13 +2317,13 @@ function setAvatarClipState(controller: AvatarAnimationController, state: Avatar
 
   nextAction.reset();
   nextAction.enabled = true;
-  nextAction.setEffectiveTimeScale(1);
+  nextAction.setEffectiveTimeScale(clampedTimeScale);
   nextAction.setEffectiveWeight(1);
 
   if (previousAction && previousAction !== nextAction) {
-    previousAction.crossFadeTo(nextAction, 0.28, true);
+    previousAction.crossFadeTo(nextAction, clampedFadeSeconds, true);
   } else {
-    nextAction.fadeIn(0.18);
+    nextAction.fadeIn(Math.min(clampedFadeSeconds, 0.22));
   }
 
   nextAction.play();
@@ -885,6 +2425,101 @@ function applyAvatarRigPose(
 
   if (speechSpeaking && state !== "speaking") {
     poseBone(rig, rig.head, nod * 0.55, 0.06, 0);
+  }
+}
+
+function applyAvatarSeatedPose(rig: AvatarRig, elapsed: number, speechSpeaking: boolean) {
+  const breath = Math.sin(elapsed * 1.45) * 0.012;
+  const talk = speechSpeaking ? Math.sin(elapsed * 4.2) * 0.08 : 0;
+
+  poseBone(rig, rig.hips, -0.1, 0, 0);
+  poseBone(rig, rig.spine, -0.08 + breath, 0, 0);
+  poseBone(rig, rig.chest, -0.04 + breath * 1.4, talk * 0.12, 0);
+  poseBone(rig, rig.upperChest, -0.02 + breath * 1.8, talk * 0.16, 0);
+  poseBone(rig, rig.neck, -0.02, talk * 0.1, 0);
+  poseBone(rig, rig.head, 0.02 + talk * 0.25, talk * 0.14, 0);
+
+  poseBone(rig, rig.leftUpperLeg, -1.12, 0.12, -0.08);
+  poseBone(rig, rig.leftLowerLeg, 1.26, 0, 0.08);
+  poseBone(rig, rig.leftFoot, -0.18, 0.02, 0.02);
+  poseBone(rig, rig.leftToes, -0.08, 0, 0);
+  poseBone(rig, rig.rightUpperLeg, -1.12, -0.12, 0.08);
+  poseBone(rig, rig.rightLowerLeg, 1.26, 0, -0.08);
+  poseBone(rig, rig.rightFoot, -0.18, -0.02, -0.02);
+  poseBone(rig, rig.rightToes, -0.08, 0, 0);
+
+  poseBone(rig, rig.leftShoulder, 0.06, 0.05, -0.08);
+  poseBone(rig, rig.leftUpperArm, -0.34 + talk * 0.22, 0.12, -0.54);
+  poseBone(rig, rig.leftLowerArm, -0.72 + talk * 0.18, 0.04, -0.18);
+  poseBone(rig, rig.leftHand, 0.08, 0.04, 0);
+  poseBone(rig, rig.rightShoulder, 0.06, -0.05, 0.08);
+  poseBone(rig, rig.rightUpperArm, -0.34 - talk * 0.22, -0.12, 0.54);
+  poseBone(rig, rig.rightLowerArm, -0.72 - talk * 0.18, -0.04, 0.18);
+  poseBone(rig, rig.rightHand, 0.08, -0.04, 0);
+}
+
+function createAvatarGroundingState(): AvatarGroundingState {
+  return {
+    bounds: new THREE.Box3(),
+    center: new THREE.Vector3(),
+    size: new THREE.Vector3(),
+    samplePosition: new THREE.Vector3(),
+    smoothedLift: 0,
+    lastMeasuredMinY: Number.POSITIVE_INFINITY,
+  };
+}
+
+function sampleLowestRigBoneY(rig: AvatarRig | null, grounding: AvatarGroundingState) {
+  if (!rig) {
+    return null;
+  }
+
+  const feet = [rig.leftFoot, rig.leftToes, rig.rightFoot, rig.rightToes];
+  let minY = Number.POSITIVE_INFINITY;
+  feet.forEach((bone) => {
+    if (!bone) {
+      return;
+    }
+    bone.getWorldPosition(grounding.samplePosition);
+    minY = Math.min(minY, grounding.samplePosition.y);
+  });
+
+  return Number.isFinite(minY) ? minY : null;
+}
+
+function stabilizeAvatarGrounding(
+  scene: THREE.Object3D,
+  rig: AvatarRig | null,
+  grounding: AvatarGroundingState,
+  floorY: number,
+  floorClearance: number,
+  floorResponse: number,
+  delta: number,
+) {
+  scene.updateMatrixWorld(true);
+  grounding.bounds.setFromObject(scene);
+  grounding.bounds.getCenter(grounding.center);
+  grounding.bounds.getSize(grounding.size);
+
+  const rigMinY = sampleLowestRigBoneY(rig, grounding);
+  const meshMinY = grounding.bounds.isEmpty() ? Number.POSITIVE_INFINITY : grounding.bounds.min.y;
+  const measuredMinY = Math.min(meshMinY, rigMinY ?? Number.POSITIVE_INFINITY);
+  if (!Number.isFinite(measuredMinY)) {
+    grounding.smoothedLift = 0;
+    grounding.lastMeasuredMinY = Number.POSITIVE_INFINITY;
+    return;
+  }
+
+  grounding.lastMeasuredMinY = measuredMinY;
+  const targetLift = THREE.MathUtils.clamp(
+    floorY + floorClearance - measuredMinY,
+    0,
+    AVATAR_GROUND_MAX_LIFT,
+  );
+  const amount = delta <= 0 ? 1 : 1 - Math.exp(-floorResponse * delta);
+  grounding.smoothedLift = THREE.MathUtils.lerp(grounding.smoothedLift, targetLift, amount);
+  if (grounding.smoothedLift > 0.0005) {
+    scene.position.y += grounding.smoothedLift;
   }
 }
 
@@ -1075,6 +2710,15 @@ function stageDebugEnabled(): boolean {
   }
 }
 
+function xrUiPreviewEnabled(): boolean {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("xrUiPreview") === "1";
+  } catch {
+    return false;
+  }
+}
+
 function buildDecisionBoard(leadSession: CodingSessionSnapshot | undefined, sessions: CodingSessionSnapshot[]): string {
   const pendingSessions = sessions.filter((session) => session.waitingOnUser);
   const blockedSessions = sessions.filter(
@@ -1138,11 +2782,242 @@ function buildWorkerBoard(leadSession: CodingSessionSnapshot | undefined, sessio
   return `${lines.join("  |  ")}.${suffix}`;
 }
 
+function buildAgentActivityBoard(
+  leadSession: CodingSessionSnapshot | undefined,
+  sessions: CodingSessionSnapshot[],
+  activityEvents: AgentWireEvent[],
+) {
+  const lines: string[] = [];
+  if (leadSession) {
+    lines.push(hermesSessionNarration(leadSession));
+  }
+  sessions
+    .filter((session) => session.sessionId !== leadSession?.sessionId)
+    .slice(0, 2)
+    .forEach((session) => {
+      lines.push(hermesSessionNarration(session));
+    });
+  activityEvents
+    .filter((event) => event.session_id || event.type.startsWith("terminal.") || event.type.startsWith("worker."))
+    .slice(0, 4)
+    .forEach((event) => {
+      lines.push(agentActivityEventLine(event));
+    });
+  return lines.length > 0
+    ? lines.map((line, index) => `${index + 1}. ${line}`).join("  ")
+    : "No worker stream yet. When Hermes launches Claude or Codex, live activity appears here.";
+}
+
+function latestSessionPreviewLine(session: CodingSessionSnapshot): string | undefined {
+  return (
+    session.screenText
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-1)[0] ??
+    session.outputTail.map((line) => line.trim()).filter(Boolean).slice(-1)[0] ??
+    session.lastUpdate ??
+    session.managerSummary ??
+    session.statusText ??
+    undefined
+  );
+}
+
+function agentActivityEventLine(event: AgentWireEvent): string {
+  const workerLabel = payloadText(event.payload, "worker_label") ?? signalLabel(event);
+  const line = payloadText(event.payload, "line");
+  const screen = payloadText(event.payload, "screen_text")
+    ?.split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .slice(-1)[0];
+  const summary = compactText(line ?? screen ?? summarizeSignal(event), event.type.replaceAll(".", " "), 140);
+  return `${formatEventTime(event.ts)} ${workerLabel}: ${summary}`;
+}
+
+function buildActivityRows(
+  leadSession: CodingSessionSnapshot | undefined,
+  sessions: CodingSessionSnapshot[],
+  activityEvents: AgentWireEvent[],
+) {
+  const ordered = orderedXrSessions(leadSession, sessions);
+  const rows = ordered.slice(0, 4).map((session) => {
+    const preview = latestSessionPreviewLine(session);
+    const label = `${session.workerLabel ?? session.title} · ${normalizeWorkerStatus(session)}`;
+    const detail =
+      preview ??
+      session.taskTitle ??
+      session.command ??
+      "Waiting for terminal activity.";
+    return { label, detail };
+  });
+
+  if (rows.length > 0) {
+    return rows;
+  }
+
+  return activityEvents
+    .filter((event) => event.session_id || event.type.startsWith("terminal.") || event.type.startsWith("worker."))
+    .slice(0, 4)
+    .map((event) => ({
+      label: `${formatEventTime(event.ts)} · ${event.type.replaceAll(".", " ")}`,
+      detail: agentActivityEventLine(event),
+    }));
+}
+
+function orderedXrSessions(
+  leadSession: CodingSessionSnapshot | undefined,
+  sessions: CodingSessionSnapshot[],
+) {
+  const ordered: CodingSessionSnapshot[] = [];
+  if (leadSession) {
+    ordered.push(leadSession);
+  }
+  sessions.forEach((session) => {
+    if (!ordered.some((entry) => entry.sessionId === session.sessionId)) {
+      ordered.push(session);
+    }
+  });
+  return ordered;
+}
+
+function hermesSessionNarration(session: CodingSessionSnapshot): string {
+  const name = session.workerLabel ?? session.title;
+  if (session.waitingOnUser) {
+    return `I need your answer for ${name}: ${compactText(session.pendingQuestion, "the worker is waiting on a decision.", 160)}`;
+  }
+  if (session.workerPhase === "blocked" || session.status === "failed") {
+    return `I found a blocker in ${name}: ${compactText(session.blockedReason ?? session.managerSummary, "the worker needs inspection.", 160)}`;
+  }
+  if (session.needsReview) {
+    return `I have ${name} ready for review. ${compactText(session.managerSummary ?? session.lastUpdate, "Review the worker result before we move on.", 150)}`;
+  }
+  const liveLine =
+    session.screenText?.split(/\r?\n/).filter(Boolean).slice(-1)[0] ??
+    session.outputTail.slice(-1)[0] ??
+    session.lastUpdate ??
+    session.managerSummary;
+  return `I am tracking ${name}: ${compactText(liveLine, session.taskTitle ?? "the worker is making progress.", 170)}`;
+}
+
+function hermesEventNarration(event: AgentWireEvent): string {
+  const summary = summarizeSignal(event);
+  if (event.type === "worker.updated") {
+    return `Worker update: ${summary}`;
+  }
+  if (event.type === "worker.pending_question") {
+    return `I need your input: ${summary}`;
+  }
+  if (event.type === "terminal.finished") {
+    return `A session finished: ${summary}`;
+  }
+  if (event.type === "terminal.failed") {
+    return `A session failed: ${summary}`;
+  }
+  if (event.type === "assistant.reply" || event.type === "hermes.status" || event.type === "agent.summary") {
+    return summary;
+  }
+  return `${event.type.replaceAll(".", " ")}: ${summary}`;
+}
+
+function buildHermesConversation({
+  leadSession,
+  sessions,
+  signalEvents,
+  latestTranscript,
+  latestSummary,
+  subtitle,
+}: {
+  leadSession: CodingSessionSnapshot | undefined;
+  sessions: CodingSessionSnapshot[];
+  signalEvents: AgentWireEvent[];
+  latestTranscript?: string;
+  latestSummary: string;
+  subtitle: string;
+}): HermesChatMessage[] {
+  const messages: HermesChatMessage[] = [];
+  const cleanedTranscript = latestTranscript?.replace(/\s+/g, " ").trim();
+  const hermesReply =
+    leadSession
+      ? hermesSessionNarration(leadSession)
+      : sessions[0]
+        ? hermesSessionNarration(sessions[0])
+        : latestSummary ?? subtitle;
+  const workerSignal =
+    leadSession?.pendingQuestion ??
+    leadSession?.blockedReason ??
+    leadSession?.taskTitle ??
+    sessions.find((session) => session.waitingOnUser || session.needsReview)?.pendingQuestion ??
+    sessions[0]?.lastUpdate;
+
+  messages.push({
+    speaker: "user",
+    label: "You",
+    text: cleanedTranscript
+      ? compactText(cleanedTranscript, "No recent voice transcript.", 170)
+      : "Say a request or reply; Hermes will keep the thread visible here.",
+  });
+
+  messages.push({
+    speaker: "hermes",
+    label: "Hermes",
+    text: compactText(hermesReply, "Standing by. I will surface the next worker decision here.", 210),
+  });
+
+  sessions.slice(0, 4).forEach((session) => {
+    if (session.sessionId === leadSession?.sessionId) {
+      return;
+    }
+    messages.push({
+      speaker: "worker",
+      label: session.workerLabel ?? session.title,
+      text: hermesSessionNarration(session),
+    });
+  });
+
+  signalEvents
+    .slice(0, 14)
+    .reverse()
+    .forEach((event) => {
+      messages.push({
+        speaker: event.session_id ? "worker" : "hermes",
+        label: `${formatEventTime(event.ts)} ${signalLabel(event)}`,
+        text: compactText(hermesEventNarration(event), event.type.replaceAll(".", " "), 220),
+      });
+    });
+
+  if (workerSignal) {
+    messages.push({
+      speaker: "worker",
+      label: leadSession?.workerLabel ?? sessions[0]?.workerLabel ?? "Worker signal",
+      text: compactText(workerSignal, "Worker status is updating.", 180),
+    });
+  }
+
+  if (leadSession?.waitingOnUser) {
+    messages.push({
+      speaker: "hermes",
+      label: "Hermes next",
+      text: `Reply to ${leadSession.workerLabel ?? leadSession.title}; I will route the answer back to the worker.`,
+    });
+  } else if (sessions.length > 0) {
+    messages.push({
+      speaker: "hermes",
+      label: "Hermes next",
+      text: `${sessions.length} worker${sessions.length === 1 ? "" : "s"} live. Select this panel to compact or expand the chat deck.`,
+    });
+  }
+
+  return messages;
+}
+
 function buildActionBoard(
   leadSession: CodingSessionSnapshot | undefined,
   sessions: CodingSessionSnapshot[],
   xrState: XRState,
   avatarStatus: AvatarLoadState,
+  deckMode: XrDeckMode,
+  deckAnchor: XrDeckAnchor,
 ) {
   const liveCount = sessions.length;
   const pendingCount = sessions.filter((session) => session.waitingOnUser).length;
@@ -1166,10 +3041,18 @@ function buildActionBoard(
     ].join(" ");
   }
 
+  if (deckMode === "hidden") {
+    return [
+      "XR panels are hidden.",
+      `${liveCount} live · ${pendingCount} pending · ${blockedCount} blocked.`,
+      `Select this handle to show panels. Deck anchor: ${deckAnchor}.`,
+    ].join(" ");
+  }
+
   return [
     `${liveCount} live · ${pendingCount} pending · ${blockedCount} blocked.`,
     `XR ${xrStatusTitle(xrState).toLowerCase()}. Avatar ${avatarStatusTitle(avatarStatus).toLowerCase()}.`,
-    "Ready for monitoring, approvals, and worker focus.",
+    `Deck ${deckMode} · ${deckAnchor}. Empty select changes deck; empty squeeze moves it.`,
   ].join(" ");
 }
 
@@ -1228,6 +3111,12 @@ function applySceneMode(scene: THREE.Scene, mode: SessionMode | null) {
     return;
   }
 
+  if (isDesktopPreviewSession()) {
+    scene.background = new THREE.Color(DESKTOP_SCENE_BACKGROUND);
+    scene.fog = new THREE.Fog(DESKTOP_SCENE_FOG, 3.4, 8.2);
+    return;
+  }
+
   scene.background = new THREE.Color(SCENE_BACKGROUND);
   scene.fog = new THREE.Fog(SCENE_BACKGROUND, 4.5, 9.5);
 }
@@ -1238,12 +3127,20 @@ function applyRuntimeSceneMode(runtime: StageRuntime, mode: SessionMode) {
   const flatGroundVisible = mode !== SessionMode.ImmersiveAR;
   runtime.floor.visible = flatGroundVisible;
   runtime.platform.visible = flatGroundVisible;
-  runtime.auraRing.visible = flatGroundVisible;
+  runtime.auraRing.visible = false;
 }
 
 function applyDesktopPreviewLayout(runtime: StageRuntime) {
+  runtime.xrUiRoot.position.set(0, 0, 0);
+  runtime.xrUiRoot.quaternion.identity();
+  runtime.xrUiRoot.scale.setScalar(1);
   runtime.camera.position.copy(DESKTOP_STAGE_LAYOUT.cameraPosition);
   runtime.camera.lookAt(DESKTOP_STAGE_LAYOUT.cameraLookAt);
+  runtime.floor.material.color.set(0xe8f2ff);
+  runtime.floor.material.metalness = 0;
+  runtime.floor.material.roughness = 0.82;
+  runtime.platform.material.color.set(0x4c8cff);
+  runtime.platform.material.opacity = 0.1;
   runtime.assistantRoot.position.set(0, DESKTOP_STAGE_LAYOUT.assistantY, DESKTOP_STAGE_LAYOUT.assistantZ);
   runtime.auraRing.position.copy(DESKTOP_STAGE_LAYOUT.auraRing);
   runtime.auraShell.position.copy(DESKTOP_STAGE_LAYOUT.auraShell);
@@ -1263,7 +3160,314 @@ function applyDesktopPreviewLayout(runtime: StageRuntime) {
 }
 
 function isDesktopPreviewActive(runtime?: StageRuntime | null): boolean {
-  return isLoopbackHost(window.location.hostname) || Boolean(runtime?.desktopPreview);
+  return !runtime?.world.session && (isLoopbackHost(window.location.hostname) || Boolean(runtime?.desktopPreview));
+}
+
+function deriveCameraAngles(camera: THREE.PerspectiveCamera) {
+  const direction = new THREE.Vector3();
+  camera.getWorldDirection(direction);
+  const yaw = Math.atan2(-direction.x, -direction.z);
+  const pitch = Math.asin(THREE.MathUtils.clamp(direction.y, -0.85, 0.85));
+  return { yaw, pitch };
+}
+
+function createPreviewLocomotionState(camera: THREE.PerspectiveCamera): PreviewLocomotionState {
+  camera.updateMatrixWorld(true);
+  const { yaw, pitch } = deriveCameraAngles(camera);
+  return {
+    keys: new Set(),
+    position: camera.position.clone(),
+    defaultPosition: camera.position.clone(),
+    iwerDefaultPosition: new THREE.Vector3(0, 1.6, 0),
+    iwerDefaultCaptured: false,
+    yaw,
+    pitch,
+    defaultYaw: yaw,
+    defaultPitch: pitch,
+    iwerDefaultYaw: 0,
+    iwerDefaultPitch: 0,
+    resetRequested: false,
+    forward: new THREE.Vector3(),
+    right: new THREE.Vector3(),
+    move: new THREE.Vector3(),
+    euler: new THREE.Euler(0, 0, 0, "YXZ"),
+    quaternion: new THREE.Quaternion(),
+  };
+}
+
+function isEditableEventTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']")) || target.isContentEditable;
+}
+
+function previewKeyAxis(keys: Set<string>, negativeCodes: string[], positiveCodes: string[]): number {
+  const negative = negativeCodes.some((code) => keys.has(code)) ? 1 : 0;
+  const positive = positiveCodes.some((code) => keys.has(code)) ? 1 : 0;
+  return positive - negative;
+}
+
+function hasPreviewMotionInput(controls: PreviewLocomotionState): boolean {
+  return (
+    controls.resetRequested ||
+    previewKeyAxis(controls.keys, ["KeyS", "ArrowDown"], ["KeyW", "ArrowUp"]) !== 0 ||
+    previewKeyAxis(controls.keys, ["KeyA"], ["KeyD"]) !== 0 ||
+    previewKeyAxis(controls.keys, ["KeyQ", "ArrowLeft"], ["KeyE", "ArrowRight"]) !== 0 ||
+    previewKeyAxis(controls.keys, ["KeyC", "PageDown"], ["Space", "PageUp"]) !== 0
+  );
+}
+
+function applyPlanarPreviewMotion(controls: PreviewLocomotionState, delta: number) {
+  const forwardInput = previewKeyAxis(controls.keys, ["KeyS", "ArrowDown"], ["KeyW", "ArrowUp"]);
+  const strafeInput = previewKeyAxis(controls.keys, ["KeyA"], ["KeyD"]);
+  const turnInput = previewKeyAxis(controls.keys, ["KeyQ", "ArrowLeft"], ["KeyE", "ArrowRight"]);
+  const verticalInput = previewKeyAxis(controls.keys, ["KeyC", "PageDown"], ["Space", "PageUp"]);
+  const speed = controls.keys.has("ShiftLeft") || controls.keys.has("ShiftRight") ? PREVIEW_FAST_SPEED : PREVIEW_WALK_SPEED;
+
+  controls.yaw -= turnInput * PREVIEW_TURN_SPEED * delta;
+  controls.forward.set(-Math.sin(controls.yaw), 0, -Math.cos(controls.yaw));
+  controls.right.set(Math.cos(controls.yaw), 0, -Math.sin(controls.yaw));
+  controls.move.set(0, 0, 0);
+  controls.move.addScaledVector(controls.forward, forwardInput);
+  controls.move.addScaledVector(controls.right, strafeInput);
+  if (controls.move.lengthSq() > 0) {
+    controls.move.normalize().multiplyScalar(speed * delta);
+    controls.position.add(controls.move);
+  }
+  controls.position.y = THREE.MathUtils.clamp(
+    controls.position.y + verticalInput * PREVIEW_VERTICAL_SPEED * delta,
+    0.35,
+    2.45,
+  );
+}
+
+function setIwerVector3(target: IwerVector3Like, value: THREE.Vector3) {
+  if (typeof target.set === "function") {
+    target.set(value.x, value.y, value.z);
+    return;
+  }
+  target.x = value.x;
+  target.y = value.y;
+  target.z = value.z;
+}
+
+function setIwerQuaternion(target: IwerQuaternionLike, value: THREE.Quaternion) {
+  if (typeof target.set === "function") {
+    target.set(value.x, value.y, value.z, value.w);
+    return;
+  }
+  target.x = value.x;
+  target.y = value.y;
+  target.z = value.z;
+  target.w = value.w;
+}
+
+function syncPreviewControlsFromIwerDevice(controls: PreviewLocomotionState, device: IwerDeviceLike) {
+  if (!device.position || !device.quaternion) {
+    return false;
+  }
+
+  controls.position.set(device.position.x, device.position.y, device.position.z);
+  controls.quaternion.set(device.quaternion.x, device.quaternion.y, device.quaternion.z, device.quaternion.w);
+  controls.euler.setFromQuaternion(controls.quaternion, "YXZ");
+  controls.yaw = controls.euler.y;
+  controls.pitch = THREE.MathUtils.clamp(controls.euler.x, -0.8, 0.8);
+
+  if (!controls.iwerDefaultCaptured) {
+    controls.iwerDefaultPosition.copy(controls.position);
+    controls.iwerDefaultYaw = controls.yaw;
+    controls.iwerDefaultPitch = controls.pitch;
+    controls.iwerDefaultCaptured = true;
+  }
+
+  return true;
+}
+
+function updateIwerPreviewLocomotion(controls: PreviewLocomotionState, delta: number): boolean {
+  const device = window.IWER_DEVICE;
+  if (!device?.position || !device.quaternion || !syncPreviewControlsFromIwerDevice(controls, device)) {
+    return false;
+  }
+
+  if (controls.resetRequested) {
+    controls.position.copy(controls.iwerDefaultPosition);
+    controls.yaw = controls.iwerDefaultYaw;
+    controls.pitch = controls.iwerDefaultPitch;
+    controls.resetRequested = false;
+  } else {
+    applyPlanarPreviewMotion(controls, delta);
+  }
+
+  controls.euler.set(controls.pitch, controls.yaw, 0, "YXZ");
+  controls.quaternion.setFromEuler(controls.euler);
+  setIwerVector3(device.position, controls.position);
+  setIwerQuaternion(device.quaternion, controls.quaternion);
+  device.notifyStateChange?.();
+  return true;
+}
+
+function updateDesktopPreviewLocomotion(
+  runtime: StageRuntime,
+  controls: PreviewLocomotionState | null,
+  delta: number,
+  desktopPreviewActive: boolean,
+  emulatorXrSession: boolean,
+) {
+  if (!controls || !hasPreviewMotionInput(controls)) {
+    return;
+  }
+
+  if (emulatorXrSession) {
+    updateIwerPreviewLocomotion(controls, delta);
+    return;
+  }
+
+  if (!desktopPreviewActive) {
+    controls.resetRequested = false;
+    return;
+  }
+
+  if (controls.resetRequested) {
+    controls.position.copy(controls.defaultPosition);
+    controls.yaw = controls.defaultYaw;
+    controls.pitch = controls.defaultPitch;
+    controls.resetRequested = false;
+  } else {
+    applyPlanarPreviewMotion(controls, delta);
+  }
+
+  controls.euler.set(controls.pitch, controls.yaw, 0, "YXZ");
+  runtime.camera.position.copy(controls.position);
+  runtime.camera.quaternion.setFromEuler(controls.euler);
+}
+
+function requestXrUiRecenter(runtime: StageRuntime) {
+  runtime.xrUi.recenterRequested = true;
+}
+
+function nextXrDeckModeValue(mode: XrDeckMode): XrDeckMode {
+  if (mode === "expanded") {
+    return "compact";
+  }
+  if (mode === "compact") {
+    return "hidden";
+  }
+  return "expanded";
+}
+
+function nextXrDeckAnchorValue(anchor: XrDeckAnchor): XrDeckAnchor {
+  if (anchor === "front") {
+    return "right";
+  }
+  if (anchor === "right") {
+    return "left";
+  }
+  return "front";
+}
+
+function xrDeckModeButtonLabel(mode: XrDeckMode) {
+  if (mode === "expanded") {
+    return "Minimize XR panels";
+  }
+  if (mode === "compact") {
+    return "Hide XR panels";
+  }
+  return "Show XR panels";
+}
+
+function updateXrUiPlacement(
+  runtime: StageRuntime,
+  activeXrSession: boolean,
+  desktopPreviewActive: boolean,
+  emulatorXrSession: boolean,
+  deckMode: XrDeckMode,
+  deckAnchor: XrDeckAnchor,
+) {
+  const previewXrUi = desktopPreviewActive && xrUiPreviewEnabled();
+  if ((!activeXrSession && !previewXrUi) || emulatorXrSession) {
+    return;
+  }
+
+  const placement = runtime.xrUi;
+  runtime.camera.updateMatrixWorld(true);
+  runtime.camera.getWorldPosition(placement.cameraPosition);
+  runtime.camera.getWorldQuaternion(placement.cameraQuaternion);
+  runtime.camera.getWorldDirection(placement.cameraForward);
+  placement.cameraForward.y = 0;
+  if (placement.cameraForward.lengthSq() < 0.0001) {
+    placement.cameraForward.set(0, 0, -1);
+  } else {
+    placement.cameraForward.normalize();
+  }
+  placement.cameraRight.set(-placement.cameraForward.z, 0, placement.cameraForward.x).normalize();
+
+  placement.targetPosition
+    .copy(placement.cameraPosition)
+    .addScaledVector(placement.cameraForward, XR_UI_DISTANCE);
+  if (deckAnchor !== "front") {
+    placement.targetPosition.addScaledVector(
+      placement.cameraRight,
+      deckAnchor === "right" ? XR_UI_ANCHOR_OFFSET : -XR_UI_ANCHOR_OFFSET,
+    );
+  }
+  placement.targetPosition.y = THREE.MathUtils.clamp(
+    placement.cameraPosition.y + XR_UI_HEIGHT_OFFSET,
+    XR_UI_MIN_HEIGHT,
+    XR_UI_MAX_HEIGHT,
+  );
+
+  const yaw = Math.atan2(-placement.cameraForward.x, -placement.cameraForward.z);
+  placement.cameraEuler.set(0, yaw, 0);
+  placement.targetQuaternion.setFromEuler(placement.cameraEuler);
+
+  if (placement.recenterRequested || runtime.xrUiRoot.position.lengthSq() < 0.0001) {
+    runtime.xrUiRoot.position.copy(placement.targetPosition);
+    runtime.xrUiRoot.quaternion.copy(placement.targetQuaternion);
+    placement.recenterRequested = false;
+  } else {
+    runtime.xrUiRoot.position.lerp(placement.targetPosition, XR_UI_LERP);
+    runtime.xrUiRoot.quaternion.slerp(placement.targetQuaternion, XR_UI_LERP);
+  }
+
+  runtime.xrUiRoot.scale.setScalar(
+    deckMode === "expanded"
+      ? XR_UI_EXPANDED_SCALE
+      : deckMode === "compact"
+        ? XR_UI_COMPACT_SCALE
+        : XR_UI_HIDDEN_SCALE,
+  );
+  runtime.panels.summary.mesh.visible = true;
+  runtime.panels.worker.mesh.visible = true;
+  runtime.panels.status.mesh.visible = true;
+  if (deckMode === "hidden") {
+    runtime.panels.summary.mesh.visible = false;
+    runtime.panels.worker.mesh.visible = false;
+    runtime.panels.status.mesh.position.set(0, XR_UI_STATUS_Y + 0.04, 0.04);
+    runtime.panels.status.mesh.scale.setScalar(0.72);
+    runtime.panels.status.mesh.rotation.set(0, 0, 0);
+    return;
+  }
+  if (deckMode === "compact") {
+    runtime.panels.summary.mesh.visible = false;
+    runtime.panels.worker.mesh.position.set(0, XR_UI_CENTER_PANEL_Y + 0.02, 0);
+    runtime.panels.worker.mesh.scale.setScalar(0.92);
+    runtime.panels.worker.mesh.rotation.set(0, 0, 0);
+    runtime.panels.status.mesh.position.set(0, XR_UI_STATUS_Y + 0.08, 0.04);
+    runtime.panels.status.mesh.scale.setScalar(0.78);
+    runtime.panels.status.mesh.rotation.set(0, 0, 0);
+    return;
+  }
+
+  runtime.panels.summary.mesh.position.set(-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02);
+  runtime.panels.worker.mesh.position.set(0, XR_UI_CENTER_PANEL_Y, 0);
+  runtime.panels.status.mesh.position.set(XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02);
+  runtime.panels.summary.mesh.scale.setScalar(0.72);
+  runtime.panels.worker.mesh.scale.setScalar(1.02);
+  runtime.panels.status.mesh.scale.setScalar(0.72);
+  runtime.panels.summary.mesh.rotation.set(0, 0.1, 0);
+  runtime.panels.worker.mesh.rotation.set(0, 0, 0);
+  runtime.panels.status.mesh.rotation.set(0, -0.1, 0);
 }
 
 function stateFeedback(state: CharacterState): string {
@@ -1316,6 +3520,8 @@ function animationFeedback(state: AnimationState): string {
       return "Yuki is surfacing an important worker interruption.";
     case "ready":
       return "Yuki has landed on a stable next step and is ready.";
+    case "sitting":
+      return "Yuki has chosen a stable low surface and is sitting.";
     default:
       return "Yuki is idling while Hermes monitors the workspace.";
   }
@@ -1323,6 +3529,28 @@ function animationFeedback(state: AnimationState): string {
 
 function motionProfile(state: AnimationState) {
   switch (state) {
+    case "sitting":
+      return {
+        bobAmplitude: 0.004,
+        bobSpeed: 0.75,
+        swayAmplitude: 0.035,
+        swaySpeed: 0.5,
+        lean: -0.02,
+        ringPulse: 0.04,
+        ringSpeed: 1.6,
+        ringOpacity: 0.7,
+        shellPulse: 0.06,
+        shellOpacity: 0.13,
+        shellSpeed: 1.4,
+        beaconPulse: 0.14,
+        beaconSpeed: 2,
+        beaconIntensity: 1.45,
+        lightIntensity: 1.72,
+        headTilt: 0.04,
+        jitter: 0,
+        shoulderRoll: 0.02,
+        focusLift: 0,
+      };
     case "listening":
       return {
         bobAmplitude: 0.04,
@@ -1468,11 +3696,17 @@ export function ImmersiveHermesStage({
   speechPulseAt,
   speechSpeaking,
   latestTranscript,
+  signalEvents,
+  activityEvents,
+  micAvailable,
+  micActive,
+  onToggleMic,
   leadSession,
   sessions,
 }: ImmersiveHermesStageProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const runtimeRef = useRef<StageRuntime | null>(null);
+  const previewControlsRef = useRef<PreviewLocomotionState | null>(null);
   const xrSessionRef = useRef<XRSession | null>(null);
   const xrSessionEndHandlerRef = useRef<(() => void) | null>(null);
   const mountedRef = useRef(true);
@@ -1483,6 +3717,22 @@ export function ImmersiveHermesStage({
   const speechPulseRef = useRef(speechPulseAt);
   const speechSpeakingRef = useRef(speechSpeaking);
   const toneRef = useRef(tone);
+  const leadSessionRef = useRef(leadSession);
+  const sessionsRef = useRef(sessions);
+  const micAvailableRef = useRef(micAvailable);
+  const micActiveRef = useRef(micActive);
+  const onToggleMicRef = useRef(onToggleMic);
+  const placementModeRef = useRef(false);
+  const xrDeckModeRef = useRef<XrDeckMode>("expanded");
+  const xrDeckAnchorRef = useRef<XrDeckAnchor>("right");
+  const xrSelectedPanelRef = useRef<XrPanelKey>("worker");
+  const xrJoystickPanelNextAtRef = useRef(0);
+  const xrJoystickScrollNextAtRef = useRef(0);
+  const xrTerminalScrollRef = useRef(0);
+  const xrChatScrollRef = useRef(0);
+  const xrFocusIndexRef = useRef(0);
+  const spatialBehaviorDebugAtRef = useRef(0);
+  const pendingEnterXrRef = useRef(false);
 
   const [avatarStatus, setAvatarStatus] = useState<AvatarLoadState>("loading");
   const [avatarMessage, setAvatarMessage] = useState(
@@ -1491,6 +3741,19 @@ export function ImmersiveHermesStage({
   const [xrState, setXrState] = useState<XRState>("checking");
   const [xrMessage, setXrMessage] = useState(
     "Checking whether this browser can enter immersive mode safely.",
+  );
+  const [placementMode, setPlacementMode] = useState(false);
+  const [xrDeckMode, setXrDeckMode] = useState<XrDeckMode>("expanded");
+  const [xrDeckAnchor, setXrDeckAnchor] = useState<XrDeckAnchor>("right");
+  const [xrSelectedPanel, setXrSelectedPanel] = useState<XrPanelKey>("worker");
+  const [xrTerminalScroll, setXrTerminalScroll] = useState(0);
+  const [xrChatScroll, setXrChatScroll] = useState(0);
+  const [xrFocusIndex, setXrFocusIndex] = useState(0);
+  const [placementMessage, setPlacementMessage] = useState(
+    "Place Yuki in front of you, then use spatial scans for smarter behavior.",
+  );
+  const [spatialBehaviorDebug, setSpatialBehaviorDebug] = useState<YukiBehaviorPlannerState>(() =>
+    createYukiBehaviorPlannerState(),
   );
   const [stageError, setStageError] = useState<string | null>(null);
   const [stageGeneration, setStageGeneration] = useState(0);
@@ -1516,8 +3779,217 @@ export function ImmersiveHermesStage({
   }, [tone]);
 
   useEffect(() => {
+    leadSessionRef.current = leadSession;
+    sessionsRef.current = sessions;
+  }, [leadSession, sessions]);
+
+  useEffect(() => {
+    micAvailableRef.current = micAvailable;
+  }, [micAvailable]);
+
+  useEffect(() => {
+    micActiveRef.current = micActive;
+  }, [micActive]);
+
+  useEffect(() => {
+    onToggleMicRef.current = onToggleMic;
+  }, [onToggleMic]);
+
+  useEffect(() => {
+    const focusSessions = orderedXrSessions(leadSession, sessions);
+    if (focusSessions.length === 0 && xrFocusIndexRef.current !== 0) {
+      xrFocusIndexRef.current = 0;
+      setXrFocusIndex(0);
+      return;
+    }
+    if (focusSessions.length > 0 && xrFocusIndexRef.current >= focusSessions.length) {
+      const next = focusSessions.length - 1;
+      xrFocusIndexRef.current = next;
+      setXrFocusIndex(next);
+    }
+  }, [leadSession, sessions]);
+
+  const setPlacementModeActive = (active: boolean) => {
+    placementModeRef.current = active;
+    setPlacementMode(active);
+  };
+
+  const setXrDeckModeActive = (mode: XrDeckMode) => {
+    xrDeckModeRef.current = mode;
+    setXrDeckMode(mode);
+    const runtime = runtimeRef.current;
+    if (runtime) {
+      requestXrUiRecenter(runtime);
+    }
+  };
+
+  const setXrDeckAnchorActive = (anchor: XrDeckAnchor) => {
+    xrDeckAnchorRef.current = anchor;
+    setXrDeckAnchor(anchor);
+    const runtime = runtimeRef.current;
+    if (runtime) {
+      requestXrUiRecenter(runtime);
+    }
+  };
+
+  const toggleXrDeckMode = () => {
+    setXrDeckModeActive(nextXrDeckModeValue(xrDeckModeRef.current));
+  };
+
+  const cycleXrDeckAnchor = () => {
+    setXrDeckAnchorActive(nextXrDeckAnchorValue(xrDeckAnchorRef.current));
+  };
+
+  const setXrSelectedPanelActive = (panel: XrPanelKey) => {
+    xrSelectedPanelRef.current = panel;
+    setXrSelectedPanel(panel);
+  };
+
+  const cycleXrSelectedPanel = (direction: 1 | -1) => {
+    const currentIndex = Math.max(0, XR_PANEL_ORDER.indexOf(xrSelectedPanelRef.current));
+    const nextPanel = XR_PANEL_ORDER[THREE.MathUtils.euclideanModulo(currentIndex + direction, XR_PANEL_ORDER.length)];
+    setXrSelectedPanelActive(nextPanel);
+    if (xrDeckModeRef.current !== "expanded") {
+      setXrDeckModeActive("expanded");
+    }
+  };
+
+  const scrollXrTerminal = (direction: 1 | -1) => {
+    const next = THREE.MathUtils.clamp(xrTerminalScrollRef.current + direction * 6, 0, 96);
+    xrTerminalScrollRef.current = next;
+    setXrTerminalScroll(next);
+  };
+
+  const scrollXrChat = (direction: 1 | -1) => {
+    const next = THREE.MathUtils.clamp(xrChatScrollRef.current + direction * 2, 0, 64);
+    xrChatScrollRef.current = next;
+    setXrChatScroll(next);
+  };
+
+  const setXrFocusIndexActive = (index: number) => {
+    const focusSessions = orderedXrSessions(leadSessionRef.current, sessionsRef.current);
+    const next = focusSessions.length > 0 ? THREE.MathUtils.euclideanModulo(index, focusSessions.length) : 0;
+    xrFocusIndexRef.current = next;
+    xrTerminalScrollRef.current = 0;
+    setXrFocusIndex(next);
+    setXrTerminalScroll(0);
+  };
+
+  const cycleXrFocus = (direction: 1 | -1) => {
+    setXrFocusIndexActive(xrFocusIndexRef.current + direction);
+  };
+
+  const scrollXrSelectedPanel = (direction: 1 | -1) => {
+    if (xrDeckModeRef.current !== "expanded") {
+      setXrDeckModeActive("expanded");
+    }
+    const selectedPanel = xrSelectedPanelRef.current;
+    if (selectedPanel === "summary") {
+      scrollXrChat(direction);
+      return;
+    }
+    if (selectedPanel === "status") {
+      cycleXrFocus(direction);
+      return;
+    }
+    scrollXrTerminal(direction);
+  };
+
+  const updateXrJoystickPanelControls = (runtime: StageRuntime) => {
+    if (!runtime.world.session || placementModeRef.current) {
+      return;
+    }
+
+    const now = performance.now();
+    const leftAxes = bestGamepadAxisPair(controllerInputSource(controllerForHand(runtime, "left"))?.gamepad);
+    const leftX = leftAxes?.x ?? 0;
+    if (Math.abs(leftX) >= XR_JOYSTICK_AXIS_THRESHOLD && now >= xrJoystickPanelNextAtRef.current) {
+      cycleXrSelectedPanel(leftX > 0 ? 1 : -1);
+      xrJoystickPanelNextAtRef.current = now + XR_JOYSTICK_REPEAT_MS;
+    } else if (Math.abs(leftX) <= XR_JOYSTICK_AXIS_RELEASE) {
+      xrJoystickPanelNextAtRef.current = Math.min(xrJoystickPanelNextAtRef.current, now);
+    }
+
+    const rightAxes = bestGamepadAxisPair(controllerInputSource(controllerForHand(runtime, "right"))?.gamepad);
+    const rightY = rightAxes?.y ?? 0;
+    if (Math.abs(rightY) >= XR_JOYSTICK_AXIS_THRESHOLD && now >= xrJoystickScrollNextAtRef.current) {
+      scrollXrSelectedPanel(rightY > 0 ? 1 : -1);
+      xrJoystickScrollNextAtRef.current = now + XR_JOYSTICK_REPEAT_MS;
+    } else if (Math.abs(rightY) <= XR_JOYSTICK_AXIS_RELEASE) {
+      xrJoystickScrollNextAtRef.current = Math.min(xrJoystickScrollNextAtRef.current, now);
+    }
+  };
+
+  function handlePlaceYuki() {
+    const runtime = runtimeRef.current;
+    if (!runtime) {
+      setPlacementMessage("Yuki placement will be available once the XR stage finishes loading.");
+      return;
+    }
+
+    const activeRealXrSession = Boolean(runtime.world.session) && !hasLocalDesktopXrEmulator();
+    if (activeRealXrSession) {
+      setPlacementModeActive(true);
+      setPlacementMessage("Aim at the floor or a low surface and press select to place Yuki.");
+      return;
+    }
+
+    const target = placeAvatarFromCamera(runtime);
+    setPlacementModeActive(false);
+    setPlacementMessage(placementSummary(target));
+  }
+
+  function finishPlacementFromSource(source: THREE.Object3D) {
+    const runtime = runtimeRef.current;
+    if (!runtime) {
+      return false;
+    }
+    const target = placeAvatarFromSource(runtime, source);
+    setPlacementModeActive(false);
+    setPlacementMessage(placementSummary(target));
+    return true;
+  }
+
+  useEffect(() => {
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const controls = previewControlsRef.current;
+      if (!controls || !PREVIEW_CONTROL_KEYS.has(event.code) || isEditableEventTarget(event.target)) {
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+      if (event.code === "KeyP") {
+        handlePlaceYuki();
+      } else if (event.code === "KeyR") {
+        controls.resetRequested = true;
+      } else {
+        controls.keys.add(event.code);
+      }
+      event.preventDefault();
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      previewControlsRef.current?.keys.delete(event.code);
+    };
+
+    const clearKeys = () => {
+      previewControlsRef.current?.keys.clear();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", clearKeys);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", clearKeys);
     };
   }, []);
 
@@ -1585,23 +4057,47 @@ export function ImmersiveHermesStage({
 
   async function enterXR() {
     if (stageError) {
+      setXrMessage(stageError);
+      return;
+    }
+
+    if (xrSessionRef.current) {
+      setXrState("active");
+      setXrMessage("XR session is already live.");
+      return;
+    }
+
+    if (xrState === "checking") {
+      pendingEnterXrRef.current = true;
+      setXrMessage("Enter XR requested. Finishing WebXR support check first.");
+      await checkXRSupport();
       return;
     }
 
     if (xrState === "failed" || xrState === "unsupported") {
+      pendingEnterXrRef.current = true;
+      setXrMessage("Retrying XR support check, then entering if the browser allows it.");
       await checkXRSupport();
       return;
     }
 
     if (xrState !== "ready") {
+      setXrMessage(`XR is ${xrStatusTitle(xrState).toLowerCase()}; wait a moment and try again.`);
       return;
     }
 
     const runtime = runtimeRef.current;
     const xr = getXRSystem();
-    if (!runtime || !xr) {
+    if (!xr) {
       setXrState("failed");
-      setXrMessage("XR runtime is not ready yet. Wait for the stage to finish initializing.");
+      setXrMessage(
+        "WebXR is not available on this page. On Quest, open the HTTPS Mac LAN URL, accept the certificate warning, then refresh.",
+      );
+      return;
+    }
+    if (!runtime) {
+      pendingEnterXrRef.current = true;
+      setXrMessage("XR stage is still loading. I will enter as soon as it is ready.");
       return;
     }
 
@@ -1648,6 +4144,7 @@ export function ImmersiveHermesStage({
       );
       webXRManager.setReferenceSpaceType(resolvedSpace);
       applyRuntimeSceneMode(runtime, sessionMode);
+      requestXrUiRecenter(runtime);
       await webXRManager.setSession(session);
       runtime.world.session = session;
 
@@ -1671,6 +4168,29 @@ export function ImmersiveHermesStage({
   }
 
   useEffect(() => {
+    const handleGlobalEnterXR = () => {
+      void enterXR();
+    };
+
+    window.__xrAgentEnterXR = handleGlobalEnterXR;
+    window.addEventListener("xr-agent-enter-xr", handleGlobalEnterXR);
+    return () => {
+      if (window.__xrAgentEnterXR === handleGlobalEnterXR) {
+        delete window.__xrAgentEnterXR;
+      }
+      window.removeEventListener("xr-agent-enter-xr", handleGlobalEnterXR);
+    };
+  }, [stageError, xrState]);
+
+  useEffect(() => {
+    if (xrState !== "ready" || !pendingEnterXrRef.current) {
+      return;
+    }
+    pendingEnterXrRef.current = false;
+    void enterXR();
+  }, [xrState]);
+
+  useEffect(() => {
     const host = hostRef.current;
     if (!host) {
       return;
@@ -1683,6 +4203,7 @@ export function ImmersiveHermesStage({
     let handleContextLost: ((event: Event) => void) | null = null;
     let handleContextRestored: (() => void) | null = null;
     let xrSessionEndHandler: (() => void) | null = null;
+    let removeWristMicListeners: (() => void) | null = null;
 
     const bootWorld = async () => {
       setStageError(null);
@@ -1791,10 +4312,12 @@ export function ImmersiveHermesStage({
           color: 0x0a1b2a,
           roughness: 0.94,
           metalness: 0.08,
+          depthWrite: false,
         }),
       );
       floor.rotation.x = -Math.PI / 2;
-      floor.position.y = -0.001;
+      floor.position.y = -0.045;
+      floor.renderOrder = -20;
       scene.add(floor);
 
       const platform = new THREE.Mesh(
@@ -1803,10 +4326,12 @@ export function ImmersiveHermesStage({
           color: 0x1b9cff,
           transparent: true,
           opacity: 0.12,
+          depthWrite: false,
         }),
       );
       platform.rotation.x = -Math.PI / 2;
-      platform.position.y = 0.01;
+      platform.position.y = -0.035;
+      platform.renderOrder = -19;
       scene.add(platform);
 
       const assistantRoot = new THREE.Group();
@@ -1862,13 +4387,35 @@ export function ImmersiveHermesStage({
       scene.add(beacon);
 
       const panels = {
-        summary: createPanel(new THREE.Vector3(-1.38, 1.02, PANEL_DEPTH), Math.PI / 9, [1, 0.68]),
-        worker: createPanel(new THREE.Vector3(1.38, 0.96, PANEL_DEPTH), -Math.PI / 9, [1, 0.68]),
-        status: createPanel(new THREE.Vector3(0, 2.34, PANEL_DEPTH - 0.12), 0, [0.84, 0.34]),
+        summary: createPanel(new THREE.Vector3(-1.38, 1.02, PANEL_DEPTH), Math.PI / 9, [1.04, 0.74]),
+        worker: createPanel(new THREE.Vector3(0, 0.96, PANEL_DEPTH), 0, [1.48, 0.92]),
+        status: createPanel(new THREE.Vector3(1.38, 0.96, PANEL_DEPTH), -Math.PI / 9, [1.04, 0.74]),
       };
+      const xrUiRoot = new THREE.Group();
+      const xrUi = createXrUiPlacementState();
+      scene.add(xrUiRoot);
       Object.values(panels).forEach((panel) => {
-        scene.add(panel.mesh);
+        xrUiRoot.add(panel.mesh);
       });
+
+      const webXRManager = renderer.xr;
+      const leftController = webXRManager.getController(0);
+      const rightController = webXRManager.getController(1);
+      const leftGrip = webXRManager.getControllerGrip(0);
+      const rightGrip = webXRManager.getControllerGrip(1);
+      const leftHand = webXRManager.getHand(0) as XRHandSpaceLike;
+      const rightHand = webXRManager.getHand(1) as XRHandSpaceLike;
+      scene.add(leftController, rightController, leftGrip, rightGrip, leftHand, rightHand);
+
+      const wristMic = createWristMicControl();
+      scene.add(wristMic.group);
+      const motionEngine = createYukiMotionEngine();
+      const avatarPlacement = createAvatarPlacementState();
+      const spatialAffordances = createSpatialAffordanceStore();
+      const affordanceDebug = createAffordanceDebugVisuals();
+      const spatialBehavior = createYukiBehaviorPlannerState();
+      scene.add(avatarPlacement.reticle);
+      scene.add(affordanceDebug.group);
 
       runtime = {
         world,
@@ -1886,13 +4433,28 @@ export function ImmersiveHermesStage({
         beacon,
         fallbackRig,
         fillLight,
+        xrUiRoot,
+        xrUi,
         panels,
+        wristMic,
+        leftHand,
+        rightHand,
+        leftGrip,
+        rightGrip,
+        leftController,
+        rightController,
         vrm: null,
         avatarScene: null,
         avatarMode: null,
         avatarRig: null,
         avatarAnimations: null,
         avatarMorphs: null,
+        avatarGrounding: createAvatarGroundingState(),
+        avatarPlacement,
+        spatialAffordances,
+        affordanceDebug,
+        spatialBehavior,
+        motionEngine,
       };
       runtimeRef.current = runtime;
       window.__xrStageDebug = {
@@ -1906,6 +4468,159 @@ export function ImmersiveHermesStage({
       if (runtime) {
         applyRuntimeSceneMode(runtime, SessionMode.ImmersiveVR);
       }
+      previewControlsRef.current = createPreviewLocomotionState(camera);
+
+      const triggerWristMicToggle = () => {
+        const liveRuntime = runtimeRef.current;
+        if (!liveRuntime || !micAvailableRef.current) {
+          return;
+        }
+        liveRuntime.wristMic.pressPulseUntil = performance.now() + 260;
+        onToggleMicRef.current();
+      };
+      const addWristMicListener = (
+        target: THREE.Object3D,
+        eventName: "selectstart" | "pinchstart" | "squeezestart",
+        handler: () => void,
+        removers: Array<() => void>,
+      ) => {
+        const eventTarget = target as THREE.Object3D & {
+          addEventListener(type: string, listener: (event: unknown) => void): void;
+          removeEventListener(type: string, listener: (event: unknown) => void): void;
+        };
+        const listener = () => handler();
+        eventTarget.addEventListener(eventName, listener);
+        removers.push(() => eventTarget.removeEventListener(eventName, listener));
+      };
+      const wristMicListenerRemovers: Array<() => void> = [];
+      [leftController, rightController].forEach((controller) => {
+        bindControllerInputSource(controller, wristMicListenerRemovers);
+      });
+      [leftController, rightController].forEach((controller) => {
+        addWristMicListener(
+          controller,
+          "selectstart",
+          () => {
+            const liveRuntime = runtimeRef.current;
+            if (!liveRuntime) {
+              return;
+            }
+            if (placementModeRef.current && finishPlacementFromSource(controller)) {
+              return;
+            }
+            if (
+              liveRuntime.wristMic.group.visible &&
+              micAvailableRef.current &&
+              (sourceRayHitsWristMic(liveRuntime.wristMic, controller) ||
+                sourceTouchesWristMic(liveRuntime.wristMic, controller))
+            ) {
+              triggerWristMicToggle();
+              return;
+            }
+            const panelHit =
+              sourceRayHitXrPanel(liveRuntime, controller) ?? sourceTouchXrPanel(liveRuntime, controller);
+            if (panelHit) {
+              setXrSelectedPanelActive(panelHit);
+              if (panelHit === "worker" && xrDeckModeRef.current === "expanded") {
+                scrollXrTerminal(1);
+                return;
+              }
+              if (panelHit === "summary" && xrDeckModeRef.current === "expanded") {
+                scrollXrChat(1);
+                return;
+              }
+              if (panelHit === "status" && xrDeckModeRef.current === "expanded") {
+                cycleXrFocus(1);
+                return;
+              }
+              toggleXrDeckMode();
+              return;
+            }
+            toggleXrDeckMode();
+          },
+          wristMicListenerRemovers,
+        );
+        addWristMicListener(
+          controller,
+          "squeezestart",
+          () => {
+            const liveRuntime = runtimeRef.current;
+            if (liveRuntime) {
+              if (placementModeRef.current && finishPlacementFromSource(controller)) {
+                return;
+              }
+              const panelHit =
+                sourceRayHitXrPanel(liveRuntime, controller) ?? sourceTouchXrPanel(liveRuntime, controller);
+              if (panelHit) {
+                setXrSelectedPanelActive(panelHit);
+                if (panelHit === "worker" && xrDeckModeRef.current === "expanded") {
+                  scrollXrTerminal(-1);
+                  return;
+                }
+                if (panelHit === "summary" && xrDeckModeRef.current === "expanded") {
+                  scrollXrChat(-1);
+                  return;
+                }
+                if (panelHit === "status" && xrDeckModeRef.current === "expanded") {
+                  cycleXrFocus(-1);
+                  return;
+                }
+                cycleXrDeckAnchor();
+                return;
+              }
+              cycleXrDeckAnchor();
+            }
+          },
+          wristMicListenerRemovers,
+        );
+      });
+      [leftHand, rightHand].forEach((hand) => {
+        addWristMicListener(
+          hand,
+          "pinchstart",
+          () => {
+            const liveRuntime = runtimeRef.current;
+            if (!liveRuntime) {
+              return;
+            }
+            if (placementModeRef.current && finishPlacementFromSource(hand)) {
+              return;
+            }
+            if (
+              liveRuntime.wristMic.group.visible &&
+              micAvailableRef.current &&
+              handTouchesWristMic(liveRuntime.wristMic, hand)
+            ) {
+              triggerWristMicToggle();
+              return;
+            }
+            const panelHit = handTouchXrPanel(liveRuntime, hand);
+            if (panelHit) {
+              setXrSelectedPanelActive(panelHit);
+              if (panelHit === "worker" && xrDeckModeRef.current === "expanded") {
+                scrollXrTerminal(1);
+                return;
+              }
+              if (panelHit === "summary" && xrDeckModeRef.current === "expanded") {
+                scrollXrChat(1);
+                return;
+              }
+              if (panelHit === "status" && xrDeckModeRef.current === "expanded") {
+                cycleXrFocus(1);
+                return;
+              }
+              toggleXrDeckMode();
+              return;
+            }
+            toggleXrDeckMode();
+          },
+          wristMicListenerRemovers,
+        );
+      });
+      removeWristMicListeners = () => {
+        wristMicListenerRemovers.forEach((remove) => remove());
+        wristMicListenerRemovers.length = 0;
+      };
 
       const clock = new THREE.Clock();
 
@@ -1973,7 +4688,7 @@ export function ImmersiveHermesStage({
           }
         });
 
-      const animate = () => {
+      const animate = (_time?: number, frame?: XRFrame) => {
         const live = runtimeRef.current;
         if (!live) {
           return;
@@ -2010,30 +4725,96 @@ export function ImmersiveHermesStage({
           }
         }
 
-        const animationState = deriveAnimationState(
+        const baseAnimationState = deriveAnimationState(
           stateRef.current,
           avatarModeRef.current,
           speechSpeakingRef.current,
         );
+        const desktopPreviewActive = isDesktopPreviewActive(live);
+        updateSpatialAffordances(live, frame, elapsed, desktopPreviewActive);
+        const behaviorPlan = planYukiBehavior({
+          baseAnimationState,
+          elapsed,
+          placement: live.avatarPlacement,
+          spatialAffordances: live.spatialAffordances,
+          state: live.spatialBehavior,
+        });
+        if (behaviorPlan.action?.type === "place-at-affordance") {
+          applyAvatarPlacement(live, behaviorPlan.action.affordance.center, {
+            source: behaviorPlan.action.source,
+            affordance: behaviorPlan.action.affordance,
+          });
+        }
+        const animationState = behaviorPlan.animationState;
+        if (mountedRef.current && stageDebugEnabled() && elapsed - spatialBehaviorDebugAtRef.current > 0.45) {
+          spatialBehaviorDebugAtRef.current = elapsed;
+          setSpatialBehaviorDebug({ ...live.spatialBehavior });
+        }
         const clipState = mapClipState(animationState);
         const motion = motionProfile(animationState);
         const accent = toneColor(toneRef.current);
         const stateAccentColor = stateAccent(stateRef.current);
-        const bob = Math.sin(elapsed * motion.bobSpeed) * motion.bobAmplitude;
-        const sway = Math.sin(elapsed * motion.swaySpeed) * motion.swayAmplitude;
         const jitter =
           motion.jitter > 0 ? Math.sin(elapsed * 16) * motion.jitter + Math.cos(elapsed * 11) * motion.jitter * 0.4 : 0;
 
-        const desktopPreviewActive = isDesktopPreviewActive(live);
-        const assistantBaseY = live.sceneMode === SessionMode.ImmersiveAR ? 0 : desktopPreviewActive ? DESKTOP_STAGE_LAYOUT.assistantY : ASSISTANT_BASE_Y;
-        live.assistantRoot.position.y = assistantBaseY;
-        live.assistantRoot.rotation.y = animationState === "alert" ? jitter * 0.12 : 0;
-        live.assistantRoot.rotation.x = 0;
-        live.assistantRoot.position.z = desktopPreviewActive ? DESKTOP_STAGE_LAYOUT.assistantZ : STAGE_DEPTH;
+        const activeXrSession = Boolean(live.world.session);
+        const emulatorXrSession = activeXrSession && hasLocalDesktopXrEmulator();
+        const yukiMotion = live.motionEngine.update({
+          state: animationState,
+          delta,
+          elapsed,
+          speechSpeaking: speechSpeakingRef.current,
+          activeXrSession,
+          desktopPreviewActive,
+          emulatorXrSession,
+        });
+        updateDesktopPreviewLocomotion(
+          live,
+          previewControlsRef.current,
+          delta,
+          desktopPreviewActive,
+          emulatorXrSession,
+        );
+        updateXrUiPlacement(
+          live,
+          activeXrSession,
+          desktopPreviewActive,
+          emulatorXrSession,
+          xrDeckModeRef.current,
+          xrDeckAnchorRef.current,
+        );
+        updateXrJoystickPanelControls(live);
+        updateWristMicPlacement(live, activeXrSession);
+        updateWristMicVisual(live.wristMic, micAvailableRef.current, micActiveRef.current, elapsed);
+        const assistantBaseY = emulatorXrSession
+          ? IWER_SIM_AVATAR_FLOOR_LIFT
+          : live.sceneMode === SessionMode.ImmersiveAR
+            ? 0
+            : desktopPreviewActive
+              ? DESKTOP_STAGE_LAYOUT.assistantY
+              : ASSISTANT_BASE_Y;
+        const placement = live.avatarPlacement;
+        const defaultAssistantZ = activeXrSession
+          ? emulatorXrSession
+            ? IWER_SIM_STAGE_DEPTH
+            : ACTIVE_XR_STAGE_DEPTH
+          : desktopPreviewActive
+            ? DESKTOP_STAGE_LAYOUT.assistantZ
+            : STAGE_DEPTH;
+        const defaultAssistantX = activeXrSession && !emulatorXrSession ? ACTIVE_XR_ASSISTANT_SIDE_X : 0;
+        const placementX = placement.hasUserPlacement ? placement.anchorPosition.x : defaultAssistantX;
+        const placementY = placement.hasUserPlacement ? placement.anchorPosition.y : 0;
+        const placementZ = placement.hasUserPlacement ? placement.anchorPosition.z : defaultAssistantZ;
+        live.assistantRoot.position.x = placementX + yukiMotion.rootOffset.x;
+        live.assistantRoot.position.y = assistantBaseY + placementY + yukiMotion.rootOffset.y;
+        live.assistantRoot.rotation.y = yukiMotion.rootRotation.y + (animationState === "alert" ? jitter * 0.12 : 0);
+        live.assistantRoot.rotation.x = yukiMotion.rootRotation.x;
+        live.assistantRoot.rotation.z = yukiMotion.rootRotation.z;
+        live.assistantRoot.position.z = placementZ + yukiMotion.rootOffset.z;
         live.platform.material.opacity = 0.12 + Math.max(0, Math.sin(elapsed * 2.8)) * 0.08;
-        live.auraRing.visible = !desktopPreviewActive && live.sceneMode !== SessionMode.ImmersiveAR;
-        live.auraShell.visible = !desktopPreviewActive;
-        live.beacon.visible = !desktopPreviewActive;
+        live.auraRing.visible = false;
+        live.auraShell.visible = !activeXrSession && !desktopPreviewActive;
+        live.beacon.visible = !activeXrSession && !desktopPreviewActive;
         live.auraRing.scale.setScalar(1 + Math.sin(elapsed * motion.ringSpeed) * motion.ringPulse);
         live.auraRing.rotation.z += delta * (0.12 + motion.ringSpeed * 0.03);
         live.auraRing.material.opacity =
@@ -2049,7 +4830,7 @@ export function ImmersiveHermesStage({
         live.beacon.material.emissiveIntensity =
           motion.beaconIntensity + Math.max(0, Math.sin(elapsed * motion.beaconSpeed)) * 0.8;
         live.camera.getWorldPosition(live.lookTarget.position);
-        live.lookTarget.position.y = Math.max(live.lookTarget.position.y, 1.35);
+        live.lookTarget.position.y = THREE.MathUtils.clamp(live.lookTarget.position.y, 1.16, 1.42);
 
         live.fillLight.color.setHex(accent);
         live.fillLight.intensity = motion.lightIntensity;
@@ -2076,19 +4857,36 @@ export function ImmersiveHermesStage({
         if (live.avatarScene && !live.fallbackRig.group.visible) {
           live.avatarScene.rotation.z = 0;
           live.avatarScene.rotation.x = 0;
-          live.avatarScene.position.y = 0;
           const basePresenceScale =
             typeof live.avatarScene.userData.basePresenceScale === "number"
               ? live.avatarScene.userData.basePresenceScale
               : 1;
+          const avatarScaleBoost = activeXrSession
+            ? emulatorXrSession
+              ? IWER_SIM_AVATAR_SCALE_BOOST
+              : ACTIVE_XR_AVATAR_SCALE_BOOST
+            : desktopPreviewActive
+              ? DESKTOP_STAGE_LAYOUT.avatarScaleBoost
+              : 1;
+          const avatarFloorLift = activeXrSession
+            ? emulatorXrSession
+              ? 0
+              : ACTIVE_XR_AVATAR_FLOOR_LIFT
+            : desktopPreviewActive
+              ? DESKTOP_PREVIEW_AVATAR_FLOOR_LIFT
+              : PREVIEW_AVATAR_FLOOR_LIFT;
+          live.avatarScene.scale.setScalar(basePresenceScale * avatarScaleBoost);
+          live.avatarScene.position.y = avatarFloorLift;
           live.avatarScene.position.z = desktopPreviewActive ? DESKTOP_STAGE_LAYOUT.avatarZOffset : 0;
-          live.avatarScene.scale.setScalar(
-            basePresenceScale * (desktopPreviewActive ? DESKTOP_STAGE_LAYOUT.avatarScaleBoost : 1),
-          );
         }
 
         if (live.avatarAnimations && !live.fallbackRig.group.visible) {
-          setAvatarClipState(live.avatarAnimations, clipState);
+          setAvatarClipState(
+            live.avatarAnimations,
+            clipState,
+            yukiMotion.clipTimeScale,
+            yukiMotion.clipCrossFadeSeconds,
+          );
           live.avatarAnimations.mixer.update(delta);
         }
 
@@ -2120,7 +4918,54 @@ export function ImmersiveHermesStage({
           applyAvatarRigPose(live.avatarRig, animationState, elapsed, speechSpeakingRef.current);
         }
 
-        live.renderer.render(live.scene, live.camera);
+        if (live.avatarRig && animationState === "sitting" && !live.fallbackRig.group.visible) {
+          applyAvatarSeatedPose(live.avatarRig, elapsed, speechSpeakingRef.current);
+        }
+
+        if (live.avatarScene && !live.fallbackRig.group.visible) {
+          stabilizeAvatarGrounding(
+            live.avatarScene,
+            live.avatarRig,
+            live.avatarGrounding,
+            live.avatarPlacement.hasUserPlacement ? live.avatarPlacement.floorY : 0,
+            yukiMotion.floorClearance,
+            yukiMotion.floorResponse,
+            delta,
+          );
+        }
+
+        if (emulatorXrSession && live.avatarScene && !live.fallbackRig.group.visible) {
+          const previousAutoClear = live.renderer.autoClear;
+          live.scene.updateMatrixWorld(true);
+          live.avatarScene.visible = false;
+          live.renderer.autoClear = previousAutoClear;
+          live.renderer.render(live.scene, live.camera);
+
+          const visibilityRestore: Array<[THREE.Object3D, boolean]> = [];
+          const keepVisible = new Set<THREE.Object3D>([live.scene, live.assistantRoot, live.avatarScene]);
+          for (let parent = live.avatarScene.parent; parent; parent = parent.parent) {
+            keepVisible.add(parent);
+          }
+          live.avatarScene.traverse((object) => keepVisible.add(object));
+          live.scene.traverse((object) => {
+            const renderObject = object as THREE.Object3D & { isLight?: boolean; isCamera?: boolean };
+            const shouldBeVisible = keepVisible.has(object) || Boolean(renderObject.isLight) || Boolean(renderObject.isCamera);
+            if (object.visible !== shouldBeVisible) {
+              visibilityRestore.push([object, object.visible]);
+              object.visible = shouldBeVisible;
+            }
+          });
+
+          live.renderer.clearDepth();
+          live.renderer.autoClear = false;
+          live.renderer.render(live.scene, live.camera);
+          visibilityRestore.forEach(([object, visible]) => {
+            object.visible = visible;
+          });
+          live.renderer.autoClear = previousAutoClear;
+        } else {
+          live.renderer.render(live.scene, live.camera);
+        }
       };
 
       renderer.setAnimationLoop(animate);
@@ -2142,6 +4987,8 @@ export function ImmersiveHermesStage({
 
     return () => {
       disposed = true;
+      removeWristMicListeners?.();
+      removeWristMicListeners = null;
       resizeObserver?.disconnect();
       const activeRuntime = runtimeRef.current;
       const activeSession = xrSessionRef.current;
@@ -2163,6 +5010,9 @@ export function ImmersiveHermesStage({
         Object.values(activeRuntime.panels).forEach((panel) => {
           disposeObjectTree(panel.mesh);
         });
+        disposeObjectTree(activeRuntime.wristMic.group);
+        disposeObjectTree(activeRuntime.avatarPlacement.reticle);
+        disposeObjectTree(activeRuntime.affordanceDebug.group);
         disposeObjectTree(activeRuntime.floor);
         disposeObjectTree(activeRuntime.platform);
         disposeObjectTree(activeRuntime.assistantRoot);
@@ -2172,6 +5022,7 @@ export function ImmersiveHermesStage({
         activeRuntime.renderer.dispose();
       }
       runtimeRef.current = null;
+      previewControlsRef.current = null;
       host.replaceChildren();
     };
   }, [stageGeneration]);
@@ -2182,37 +5033,104 @@ export function ImmersiveHermesStage({
       return;
     }
 
-    drawPanel(runtime.panels.summary, {
-      eyebrow: "Manager board",
-      title: leadSession?.waitingOnUser ? "Decision needed" : title,
-      body: buildDecisionBoard(leadSession, sessions),
-      tone: leadSession?.waitingOnUser ? "attention" : tone,
-    });
+    const xrSessions = orderedXrSessions(leadSession, sessions);
+    const safeFocusIndex =
+      xrSessions.length > 0 ? THREE.MathUtils.clamp(xrFocusIndex, 0, xrSessions.length - 1) : 0;
+    const xrFocusSession = xrSessions[safeFocusIndex];
+    const xrFocusLabel =
+      xrSessions.length > 0
+        ? `Worker ${safeFocusIndex + 1}/${xrSessions.length}`
+        : "No worker selected";
 
-    drawPanel(runtime.panels.worker, {
-      eyebrow: "Worker board",
-      title:
-        leadSession?.workerLabel ??
-        `${sessions.length} live worker${sessions.length === 1 ? "" : "s"}`,
-      body: buildWorkerBoard(leadSession, sessions),
-      tone:
-        leadSession?.waitingOnUser
-          ? "attention"
-          : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+    if (xrDeckMode === "expanded") {
+      drawChatPanel(
+        runtime.panels.summary,
+        buildHermesConversation({
+          leadSession,
+          sessions,
+          signalEvents,
+          latestTranscript,
+          latestSummary,
+          subtitle,
+        }),
+        {
+          tone: leadSession?.waitingOnUser ? "attention" : tone,
+          compact: true,
+          scrollOffset: xrChatScroll,
+        },
+      );
+      drawTerminalPanel(runtime.panels.worker, xrFocusSession, {
+        tone:
+          leadSession?.waitingOnUser
             ? "attention"
-            : tone,
-    });
+            : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+              ? "attention"
+              : tone,
+        scrollOffset: xrTerminalScroll,
+        focusLabel: xrFocusLabel,
+      });
+    } else {
+      drawPanel(runtime.panels.summary, {
+        eyebrow: "Manager board",
+        title: leadSession?.waitingOnUser ? "Decision needed" : title,
+        body: buildDecisionBoard(leadSession, sessions),
+        tone: leadSession?.waitingOnUser ? "attention" : tone,
+      });
+      drawChatPanel(
+        runtime.panels.worker,
+        buildHermesConversation({
+          leadSession,
+          sessions,
+          signalEvents,
+          latestTranscript,
+          latestSummary,
+          subtitle,
+        }),
+        {
+          tone:
+            leadSession?.waitingOnUser
+              ? "attention"
+              : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+                ? "attention"
+                : tone,
+          compact: xrDeckMode === "compact",
+          scrollOffset: xrChatScroll,
+        },
+      );
+    }
 
-    drawPanel(runtime.panels.status, {
-      eyebrow: "Next action",
-      title: leadSession?.waitingOnUser ? "Reply through Hermes" : "Next move",
-      body: buildActionBoard(leadSession, sessions, xrState, avatarStatus),
-      tone:
-        leadSession?.waitingOnUser
-          ? "attention"
-          : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+    if (xrDeckMode === "expanded") {
+      drawActivityPanel(runtime.panels.status, {
+        leadSession,
+        sessions,
+        activityEvents,
+        tone:
+          leadSession?.waitingOnUser
             ? "attention"
-            : tone,
+            : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+              ? "attention"
+              : tone,
+      });
+    } else {
+      drawPanel(runtime.panels.status, {
+        eyebrow: "Deck controls",
+        title: xrDeckMode === "hidden" ? "Panels hidden" : "Chat minimized",
+        body: buildActionBoard(leadSession, sessions, xrState, avatarStatus, xrDeckMode, xrDeckAnchor),
+        tone:
+          leadSession?.waitingOnUser
+            ? "attention"
+            : sessions.some((session) => session.workerPhase === "blocked" || session.status === "failed")
+              ? "attention"
+              : tone,
+      });
+    }
+
+    (Object.keys(runtime.panels) as XrPanelKey[]).forEach((panelKey) => {
+      drawPanelFocusFrame(
+        runtime.panels[panelKey],
+        xrSelectedPanel === panelKey,
+        `Stick focus: ${xrPanelFocusLabel(panelKey)}`,
+      );
     });
 
     runtime.auraRing.material.color.setHex(toneColor(tone));
@@ -2220,7 +5138,26 @@ export function ImmersiveHermesStage({
     runtime.auraShell.material.color.setHex(stateAccent(characterState));
     runtime.auraShell.material.emissive.setHex(stateAccent(characterState));
     runtime.beacon.material.emissive.setHex(stateAccent(characterState));
-  }, [avatarStatus, characterState, leadSession, latestSummary, sessions, subtitle, title, tone, xrState]);
+  }, [
+    avatarStatus,
+    activityEvents,
+    characterState,
+    leadSession,
+    latestSummary,
+    latestTranscript,
+    signalEvents,
+    sessions,
+    subtitle,
+    title,
+    tone,
+    xrDeckAnchor,
+    xrChatScroll,
+    xrDeckMode,
+    xrFocusIndex,
+    xrSelectedPanel,
+    xrTerminalScroll,
+    xrState,
+  ]);
 
   const xrButtonLabel =
     xrState === "entering"
@@ -2248,26 +5185,95 @@ export function ImmersiveHermesStage({
     (session) => session.workerPhase === "blocked" || session.status === "failed",
   );
   const reviewSessions = sessions.filter((session) => session.needsReview);
-  const stageAnimationState = deriveAnimationState(characterState, avatarMode, speechSpeaking);
+  const baseStageAnimationState = deriveAnimationState(characterState, avatarMode, speechSpeaking);
+  const stageAnimationState: AnimationState =
+    spatialBehaviorDebug.mode === "sitting" ? "sitting" : baseStageAnimationState;
   const speechPulseAgeMs = speechPulseAt > 0 ? Math.max(0, Date.now() - speechPulseAt) : null;
   const decisionFocus =
     leadSession?.pendingQuestion ??
     leadSession?.managerSummary ??
     latestSummary;
   const focusWorker = leadSession ?? blockedSessions[0] ?? sessions[0];
+  const xrFocusSessions = orderedXrSessions(leadSession, sessions);
+  const safeXrFocusIndex =
+    xrFocusSessions.length > 0 ? THREE.MathUtils.clamp(xrFocusIndex, 0, xrFocusSessions.length - 1) : 0;
+  const xrFocusWorker = xrFocusSessions[safeXrFocusIndex];
   const showStageDebug = stageDebugEnabled();
 
   return (
     <div className="presence-stage presence-stage-immersive">
       <div ref={hostRef} className="immersive-stage-canvas" />
       <div className="immersive-stage-overlay">
+        <div className="immersive-stage-control-hint" aria-hidden="true">
+          <span>Move WASD / arrows</span>
+          <span>Turn Q/E</span>
+          <span>Height Space/C</span>
+          <span>Reset R</span>
+          <span>Deck {xrDeckMode}</span>
+          <span>Anchor {xrDeckAnchor}</span>
+          <span>Panel {xrPanelFocusLabel(xrSelectedPanel)}</span>
+        </div>
         <div className="immersive-stage-copy">
           <p className="eyebrow">Quest XR Stage</p>
-          <h2>Yuki leads. Workers stay readable.</h2>
-          <p>
-            Hermes still manages the workers and decisions. This stage keeps the live worker board, next action, and
-            approval context visible around Yuki instead of burying them in tiny status copy.
+          <h2>Yuki / Hermes core</h2>
+          <p className="immersive-stage-mode-pill">
+            Deck {xrDeckMode} · {xrDeckAnchor}
           </p>
+          <p className="immersive-stage-mode-pill">
+            Focus {xrFocusSessions.length > 0 ? `${safeXrFocusIndex + 1}/${xrFocusSessions.length}` : "none"}
+          </p>
+          <p className="immersive-stage-mode-pill">Panel {xrPanelFocusLabel(xrSelectedPanel)}</p>
+          <p>
+            {avatarMode === "listening" || speechSpeaking
+              ? "Listening for your instruction."
+              : xrFocusWorker
+                ? compactText(
+                    xrFocusWorker.pendingQuestion ??
+                      xrFocusWorker.blockedReason ??
+                      xrFocusWorker.managerSummary ??
+                      xrFocusWorker.lastUpdate ??
+                      xrFocusWorker.taskTitle,
+                    "Worker focus active.",
+                    96,
+                  )
+                : "Standing by for the next coding task."}
+          </p>
+        </div>
+        <div className="immersive-stage-placement-dock">
+          <button
+            type="button"
+            className={`quest-xr-button quest-place-button ${placementMode ? "is-active" : ""}`}
+            onClick={handlePlaceYuki}
+          >
+            {placementMode ? "Aim + select" : "Place Yuki"}
+          </button>
+          <div className="xr-deck-controls">
+            <button type="button" className="mini-link-button" onClick={toggleXrDeckMode}>
+              {xrDeckModeButtonLabel(xrDeckMode)}
+            </button>
+            <button type="button" className="mini-link-button" onClick={cycleXrDeckAnchor}>
+              Move {nextXrDeckAnchorValue(xrDeckAnchor)}
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => cycleXrFocus(1)}>
+              Next worker
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => cycleXrFocus(-1)}>
+              Previous worker
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => scrollXrTerminal(1)}>
+              Terminal older
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => scrollXrTerminal(-1)}>
+              Terminal newer
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => scrollXrChat(1)}>
+              Chat older
+            </button>
+            <button type="button" className="mini-link-button" onClick={() => scrollXrChat(-1)}>
+              Chat newer
+            </button>
+          </div>
+          <p className={`placement-status ${placementMode ? "is-active" : ""}`}>{placementMessage}</p>
         </div>
         <div className="immersive-stage-status-stack">
           {showStageDebug ? (
@@ -2276,10 +5282,18 @@ export function ImmersiveHermesStage({
               <div className="immersive-debug-grid">
                 <span>Animation</span>
                 <strong>{stageAnimationState}</strong>
+                <span>Planner</span>
+                <strong>{spatialBehaviorDebug.mode}</strong>
+                <span>Priority</span>
+                <strong>{spatialBehaviorDebug.priority}</strong>
+                <span>Affordance</span>
+                <strong>{spatialBehaviorDebug.activeAffordanceKind ?? "none"}</strong>
                 <span>Hermes mode</span>
                 <strong>{avatarMode}</strong>
                 <span>Speech</span>
                 <strong>{speechSpeaking ? "active" : "idle"}</strong>
+                <span>Mic</span>
+                <strong>{micAvailable ? (micActive ? "recording" : "ready") : "setup"}</strong>
                 <span>Pulse age</span>
                 <strong>{speechPulseAgeMs === null ? "none" : `${speechPulseAgeMs} ms`}</strong>
                 <span>Focus</span>
@@ -2292,7 +5306,7 @@ export function ImmersiveHermesStage({
               ) : (
                 <p className="immersive-debug-transcript">Heard: No transcript yet.</p>
               )}
-              <p>{animationFeedback(stageAnimationState)}</p>
+              <p>{spatialBehaviorDebug.message || animationFeedback(stageAnimationState)}</p>
             </div>
           ) : null}
           <div className="immersive-stage-status-card">
@@ -2303,7 +5317,7 @@ export function ImmersiveHermesStage({
             <p>{compactText(decisionFocus, "No worker decision is waiting right now.", 150)}</p>
           </div>
           <div className="immersive-stage-status-card">
-            <p className="eyebrow">Worker Focus</p>
+            <p className="eyebrow">Hermes Conversation</p>
             <strong>{focusWorker?.workerLabel ?? `${sessions.length} live worker${sessions.length === 1 ? "" : "s"}`}</strong>
             <p>
               {focusWorker
@@ -2314,19 +5328,79 @@ export function ImmersiveHermesStage({
                     "No live worker focus yet.",
                     150,
                   )
-                : buildWorkerSummary(sessions)}
+                : compactText(latestTranscript, buildWorkerSummary(sessions), 150)}
             </p>
+            <div className="xr-deck-controls">
+              <button type="button" className="mini-link-button" onClick={toggleXrDeckMode}>
+                {xrDeckModeButtonLabel(xrDeckMode)}
+              </button>
+              <button type="button" className="mini-link-button" onClick={cycleXrDeckAnchor}>
+                Move {nextXrDeckAnchorValue(xrDeckAnchor)}
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => cycleXrFocus(1)}>
+                Next worker
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => cycleXrFocus(-1)}>
+                Previous worker
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => scrollXrTerminal(1)}>
+                Terminal older
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => scrollXrTerminal(-1)}>
+                Terminal newer
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => scrollXrChat(1)}>
+                Chat older
+              </button>
+              <button type="button" className="mini-link-button" onClick={() => scrollXrChat(-1)}>
+                Chat newer
+              </button>
+            </div>
           </div>
-          <div className={`immersive-stage-status-card ${avatarCardTone}`}>
-            <p className="eyebrow">Avatar Runtime</p>
-            <strong>{avatarStatusTitle(avatarStatus)}</strong>
-            <p>{avatarMessage}</p>
-          </div>
-          <div className={`immersive-stage-status-card ${xrCardTone}`}>
+          {showStageDebug ? (
+            <div className={`immersive-stage-status-card ${avatarCardTone}`}>
+              <p className="eyebrow">Avatar Runtime</p>
+              <strong>{avatarStatusTitle(avatarStatus)}</strong>
+              <p>{avatarMessage}</p>
+            </div>
+          ) : null}
+          <div className={`immersive-stage-status-card immersive-stage-xr-card ${xrCardTone}`}>
             <p className="eyebrow">XR Entry</p>
             <strong>{xrStatusTitle(xrState)}</strong>
             <p>{stageError ?? xrMessage}</p>
+            <p className={`placement-status ${placementMode ? "is-active" : ""}`}>{placementMessage}</p>
             <div className="xr-button-slot">
+              <button
+                type="button"
+                className={`quest-xr-button quest-place-button ${placementMode ? "is-active" : ""}`}
+                onClick={handlePlaceYuki}
+              >
+                {placementMode ? "Aim + select" : "Place Yuki"}
+              </button>
+              <button type="button" className="quest-xr-button" onClick={toggleXrDeckMode}>
+                {xrDeckModeButtonLabel(xrDeckMode)}
+              </button>
+              <button type="button" className="quest-xr-button" onClick={cycleXrDeckAnchor}>
+                Move {nextXrDeckAnchorValue(xrDeckAnchor)}
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => cycleXrFocus(1)}>
+                Next worker
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => cycleXrFocus(-1)}>
+                Previous worker
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => scrollXrTerminal(1)}>
+                Terminal older
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => scrollXrTerminal(-1)}>
+                Terminal newer
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => scrollXrChat(1)}>
+                Chat older
+              </button>
+              <button type="button" className="quest-xr-button" onClick={() => scrollXrChat(-1)}>
+                Chat newer
+              </button>
               <button
                 type="button"
                 className="quest-xr-button"

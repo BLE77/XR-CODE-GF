@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>XR Coding Agent Command Center</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23101416'/%3E%3Cpath d='M18 18h28v8H18zm0 14h28v8H18zm0 14h20v8H18z' fill='%2374d3a3'/%3E%3C/svg%3E" />
+    <title>Hermes OS Command Center</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%23edf5ff'/%3E%3Cpath d='M19 16h26v6H19zm0 13h26v6H19zm0 13h18v6H19z' fill='%231464f3'/%3E%3Ccircle cx='49' cy='16' r='5' fill='%2334d4c1'/%3E%3C/svg%3E" />
     <style>
       :root {
         color-scheme: dark;
@@ -408,9 +408,426 @@
         font-size: 14px;
       }
 
+      /* Hermes OS desktop/operator skin. The Command Center keeps the same
+         backend controls, but visually joins the Quest/Yuki client system. */
+      :root {
+        color-scheme: light;
+        --bg: #f4f8ff;
+        --bg-deep: #e2efff;
+        --panel: rgba(255, 255, 255, 0.66);
+        --panel-strong: rgba(255, 255, 255, 0.84);
+        --panel-soft: rgba(226, 239, 255, 0.74);
+        --text: #071b54;
+        --muted: rgba(7, 27, 84, 0.58);
+        --muted-strong: rgba(7, 27, 84, 0.74);
+        --accent: #1462f3;
+        --accent-2: #35cfc7;
+        --accent-soft: rgba(20, 98, 243, 0.12);
+        --danger: #e64b4b;
+        --warning: #e99018;
+        --border: rgba(20, 98, 243, 0.16);
+        --border-strong: rgba(20, 98, 243, 0.28);
+        --shadow: 0 28px 70px rgba(56, 105, 194, 0.16);
+        --radius: 34px;
+      }
+
+      body {
+        background:
+          radial-gradient(circle at 14% 6%, rgba(20, 98, 243, 0.16), transparent 24rem),
+          radial-gradient(circle at 84% 12%, rgba(53, 207, 199, 0.17), transparent 22rem),
+          radial-gradient(circle at 42% 58%, rgba(255, 255, 255, 0.82), transparent 28rem),
+          linear-gradient(135deg, #ffffff 0%, var(--bg) 52%, var(--bg-deep) 100%);
+        overflow-x: hidden;
+      }
+
+      .shell {
+        position: relative;
+        width: min(1500px, calc(100vw - 32px));
+        margin: 24px auto 36px;
+      }
+
+      .shell::before,
+      .shell::after {
+        content: "";
+        position: fixed;
+        pointer-events: none;
+        z-index: -1;
+      }
+
+      .shell::before {
+        width: 34rem;
+        height: 34rem;
+        left: -9rem;
+        top: -12rem;
+        border-radius: 42% 58% 62% 38%;
+        background: rgba(20, 98, 243, 0.08);
+      }
+
+      .shell::after {
+        width: 40rem;
+        height: 24rem;
+        right: -10rem;
+        bottom: -10rem;
+        border-radius: 999px;
+        border: 1px solid rgba(20, 98, 243, 0.12);
+        box-shadow: inset 0 0 0 32px rgba(20, 98, 243, 0.025);
+      }
+
+      .hero {
+        grid-template-columns: minmax(0, 1.18fr) minmax(360px, 0.82fr);
+      }
+
+      .card {
+        position: relative;
+        overflow: hidden;
+        background:
+          linear-gradient(145deg, rgba(255, 255, 255, 0.9), rgba(241, 247, 255, 0.58)),
+          var(--panel);
+        border-color: var(--border);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(26px);
+      }
+
+      .card::after {
+        content: "";
+        position: absolute;
+        inset: 1px;
+        border-radius: calc(var(--radius) - 1px);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+        pointer-events: none;
+      }
+
+      .hero-main {
+        min-height: 24rem;
+        padding: 28px 30px;
+      }
+
+      .hero-main::before {
+        content: "";
+        position: absolute;
+        width: 36rem;
+        height: 36rem;
+        right: -13rem;
+        top: -16rem;
+        border: 1px solid rgba(20, 98, 243, 0.12);
+        border-radius: 50%;
+        box-shadow:
+          0 0 0 42px rgba(20, 98, 243, 0.025),
+          0 0 0 84px rgba(20, 98, 243, 0.02);
+      }
+
+      .brand-row {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 24px;
+      }
+
+      .brand-lockup {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+      }
+
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 58px;
+        height: 58px;
+        border: 1px solid var(--border-strong);
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.64);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.92);
+        color: var(--accent);
+        font-family: var(--mono);
+        font-weight: 900;
+        font-size: 22px;
+      }
+
+      .version-code {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.12em;
+      }
+
+      .quest-link {
+        color: var(--accent);
+        text-decoration: none;
+      }
+
+      .eyebrow,
+      .section-title {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-weight: 800;
+      }
+
+      .eyebrow {
+        letter-spacing: 0.18em;
+      }
+
+      .section-title {
+        letter-spacing: 0.2em;
+      }
+
+      h1 {
+        position: relative;
+        z-index: 1;
+        max-width: 12ch;
+        font-size: clamp(44px, 6vw, 76px);
+        line-height: 0.88;
+        letter-spacing: -0.055em;
+        margin-bottom: 18px;
+      }
+
+      .hero-copy {
+        position: relative;
+        z-index: 1;
+        font-size: clamp(16px, 1.4vw, 20px);
+        color: var(--muted-strong);
+      }
+
+      .hero-stats {
+        position: relative;
+        z-index: 1;
+        margin-top: 26px;
+      }
+
+      .pill {
+        min-height: 42px;
+        padding: 10px 16px;
+        background: rgba(255, 255, 255, 0.54);
+        color: var(--muted-strong);
+        font-size: 14px;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+      }
+
+      .pill strong {
+        color: var(--text);
+      }
+
+      .status-dot {
+        width: 10px;
+        height: 10px;
+        background: var(--accent-2);
+        box-shadow: 0 0 0 7px rgba(53, 207, 199, 0.14);
+      }
+
+      .hero-side,
+      .panel {
+        padding: 28px;
+      }
+
+      .meta-block,
+      .hero-summary,
+      .project-card,
+      .session-card,
+      details.advanced,
+      textarea,
+      .empty {
+        background: var(--panel-strong);
+        border-color: var(--border);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+      }
+
+      .meta-block {
+        border-radius: 24px;
+      }
+
+      .meta-label {
+        font-family: var(--mono);
+        letter-spacing: 0.1em;
+      }
+
+      .meta-value {
+        color: var(--text);
+        font-size: 18px;
+        font-weight: 750;
+      }
+
+      .hero-summary {
+        border-radius: 28px;
+        background:
+          radial-gradient(circle at 10% 5%, rgba(20, 98, 243, 0.12), transparent 14rem),
+          rgba(255, 255, 255, 0.56);
+      }
+
+      .hero-summary strong {
+        color: var(--text);
+        font-size: 20px;
+      }
+
+      .grid {
+        grid-template-columns: minmax(320px, 0.38fr) minmax(0, 1fr);
+      }
+
+      .project-card,
+      .session-card {
+        border-radius: 30px;
+      }
+
+      .project-card.active,
+      .session-card.active {
+        border-color: rgba(20, 98, 243, 0.46);
+        box-shadow:
+          inset 0 0 0 1px rgba(20, 98, 243, 0.16),
+          0 18px 42px rgba(56, 105, 194, 0.12);
+      }
+
+      .project-name,
+      .session-title {
+        color: var(--text);
+        font-size: 20px;
+        font-weight: 850;
+      }
+
+      button {
+        border: 1px solid transparent;
+        padding: 11px 16px;
+        font-weight: 750;
+      }
+
+      button:hover {
+        box-shadow: 0 12px 24px rgba(56, 105, 194, 0.16);
+      }
+
+      .primary {
+        background: linear-gradient(135deg, #36dcce, #2f7cff);
+        color: #ffffff;
+      }
+
+      .secondary {
+        background: rgba(255, 255, 255, 0.64);
+        border-color: var(--border);
+        color: var(--text);
+      }
+
+      .danger {
+        background: rgba(230, 75, 75, 0.08);
+        border-color: rgba(230, 75, 75, 0.18);
+        color: var(--danger);
+      }
+
+      .badge {
+        background: rgba(255, 255, 255, 0.62);
+        border: 1px solid var(--border);
+        color: var(--muted-strong);
+        font-family: var(--mono);
+        font-weight: 800;
+        text-transform: uppercase;
+      }
+
+      .badge.running {
+        color: var(--accent-2);
+      }
+
+      .badge.finished {
+        color: var(--accent);
+      }
+
+      .meta-chip {
+        border-radius: 20px;
+        background: var(--panel-soft);
+        color: var(--muted-strong);
+        border: 1px solid rgba(20, 98, 243, 0.08);
+      }
+
+      .meta-chip strong {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .manager-summary {
+        border-radius: 22px;
+        background: rgba(20, 98, 243, 0.06);
+        border-color: rgba(20, 98, 243, 0.12);
+        color: var(--muted-strong);
+      }
+
+      .decision-banner {
+        border-radius: 22px;
+        background: rgba(233, 144, 24, 0.1);
+        border-color: rgba(233, 144, 24, 0.18);
+        color: #6c4308;
+      }
+
+      .screen {
+        max-height: 320px;
+        background: #07122a;
+        border-color: rgba(20, 98, 243, 0.16);
+        border-radius: 24px;
+        color: #dff3ff;
+        font-size: 12.5px;
+        line-height: 1.48;
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+      }
+
+      details.advanced {
+        border-radius: 22px;
+      }
+
+      details.advanced > summary {
+        font-family: var(--mono);
+        letter-spacing: 0.04em;
+      }
+
+      textarea {
+        border-radius: 22px;
+        color: var(--text);
+        outline: none;
+      }
+
+      textarea:focus {
+        border-color: rgba(20, 98, 243, 0.46);
+        box-shadow: 0 0 0 4px rgba(20, 98, 243, 0.08);
+      }
+
+      .empty {
+        padding: 22px;
+        border-style: dashed;
+        border-radius: 24px;
+      }
+
       @media (max-width: 1100px) {
         .hero,
         .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .shell {
+          width: min(100vw - 18px, 1500px);
+          margin-top: 9px;
+        }
+
+        .hero-main,
+        .hero-side,
+        .panel {
+          padding: 18px;
+        }
+
+        .brand-row,
+        .section-head,
+        .session-header {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+
+        h1 {
+          font-size: 44px;
+        }
+
+        .hero-side .meta-grid,
+        .session-meta {
           grid-template-columns: 1fr;
         }
       }
@@ -420,11 +837,21 @@
     <div class="shell">
       <section class="hero">
         <div class="card hero-main">
-          <div class="eyebrow">XR Coding Agent</div>
-          <h1>Mac Command Center</h1>
+          <div class="brand-row">
+            <div class="brand-lockup">
+              <div class="brand-mark">H</div>
+              <div>
+                <div class="eyebrow">Hermes OS</div>
+                <div class="version-code">MAC OPERATOR DECK · HS-MAC</div>
+              </div>
+            </div>
+            <a class="pill quest-link" href="http://127.0.0.1:5173/" target="_blank" rel="noreferrer">Open Quest Client ↗</a>
+          </div>
+          <h1>Mac Operator Center</h1>
           <p class="hero-copy">
-            Keep one active project, Hermes supervisor, and your worker sessions in one calmer control plane.
-            The default view stays manager-first. Raw terminal controls and unsafe actions stay available, but only when you ask for them.
+            Keep Hermes, project focus, and managed Claude/Codex workers synced from the Mac side.
+            The Quest client stays immersive and manager-first; this deck is the denser operator console for recovery,
+            diagnostics, and explicit worker control.
           </p>
           <div class="hero-stats">
             <div class="pill"><span class="status-dot"></span><span id="bridge-status">Connecting to control bridge…</span></div>
