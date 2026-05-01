@@ -896,7 +896,9 @@ export function useQuestClient() {
   const latestHermesUpdate = events.find((event) =>
     ["assistant.reply", "agent.summary", "hermes.status"].includes(event.type),
   );
-  const latestAssistantReply = events.find((event) => event.type === "assistant.reply");
+  const latestAssistantReply = events.find(
+    (event) => event.type === "assistant.reply" || event.type === "avatar.speaking",
+  );
   const hermesPhase = deriveHermesPhase(events, sessions);
   const prioritySession = pendingSession ?? attentionSessions[0] ?? liveSessions[0] ?? sessions[0];
   const headsetPrompt = deriveHeadsetPrompt(

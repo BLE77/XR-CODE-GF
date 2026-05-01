@@ -456,6 +456,7 @@ export default function App() {
     if (backendAudioUrl) {
       const audio = new Audio(backendAudioUrl);
       audio.preload = "auto";
+      audio.volume = 1;
       audio.onplay = () => {
         activeAudioRef.current = audio;
         startSpeechPulse();
@@ -853,6 +854,7 @@ export default function App() {
       stopVoicePrompt();
       return;
     }
+    setSpeechEnabled(true);
     startVoicePrompt();
   }
 

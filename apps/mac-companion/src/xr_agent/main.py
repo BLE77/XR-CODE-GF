@@ -806,25 +806,7 @@ class XRAgentApp:
         duration_ms = max(2200, min(9000, len(normalized) * 58))
         return {"duration_ms": duration_ms}
 
-    def _speech_payload(self, text: str) -> tuple[str, dict[str, Any]]:
-        future = self._speech_executor.submit(self.speech.synthesize, text)
-        try:
-            synthesis = future.result(timeout=self._speech_timeout_seconds)
-        except FutureTimeoutError:
-            future.cancel()
-            spoken = text.strip() or text
-            return spoken, {
-                "text": spoken,
-                **self._speech_timing_payload(spoken),
-                "voice_provider": "browser-fallback",
-            }
-        except Exception:
-            spoken = text.strip() or text
-            return spoken, {
-                "text": spoken,
-                **self._speech_timing_payload(spoken),
-                "voice_provider": "browser-fallback",
-            }
+    def _speech_payload_from_synthesis(self, synthesis: Any) -> tuple[str, dict[str, Any]]:
         spoken = synthesis.text
         payload: dict[str, Any] = {
             "text": spoken,
@@ -846,6 +828,40 @@ class XRAgentApp:
         if synthesis.model_id:
             payload["voice_model_id"] = synthesis.model_id
         return spoken, payload
+
+    def _publish_delayed_speech_payload(self, future: Any, session_id: str | None) -> None:
+        try:
+            synthesis = future.result()
+        except Exception:
+            return
+        _, payload = self._speech_payload_from_synthesis(synthesis)
+        if not payload.get("audio_base64"):
+            return
+        payload["speech_delivery"] = "delayed-backend"
+        self.events.publish(make_event("avatar.speaking", session_id, payload))
+
+    def _speech_payload(self, text: str, *, session_id: str | None = None) -> tuple[str, dict[str, Any]]:
+        future = self._speech_executor.submit(self.speech.synthesize, text)
+        try:
+            synthesis = future.result(timeout=self._speech_timeout_seconds)
+        except FutureTimeoutError:
+            if not future.cancel():
+                future.add_done_callback(lambda completed: self._publish_delayed_speech_payload(completed, session_id))
+            spoken = text.strip() or text
+            return spoken, {
+                "text": spoken,
+                **self._speech_timing_payload(spoken),
+                "voice_provider": "browser-fallback",
+                "backend_audio_pending": True,
+            }
+        except Exception:
+            spoken = text.strip() or text
+            return spoken, {
+                "text": spoken,
+                **self._speech_timing_payload(spoken),
+                "voice_provider": "browser-fallback",
+            }
+        return self._speech_payload_from_synthesis(synthesis)
 
     def _respond(self, text: str) -> dict[str, Any]:
         spoken, payload = self._speech_payload(text)
@@ -981,7 +997,7 @@ class XRAgentApp:
         )
 
     def _publish_coding_session_reply(self, session: ManagedCodingSession, text: str) -> str:
-        spoken, speech_payload = self._speech_payload(text)
+        spoken, speech_payload = self._speech_payload(text, session_id=session.session_id)
         payload = {
             "title": session.title,
             "intent": session.intent,
@@ -2037,7 +2053,7 @@ class XRAgentApp:
             manager_summary=manager_summary,
             last_update=f"User replied: {transcript.strip()}",
         )
-        _, speech_payload = self._speech_payload(reply)
+        _, speech_payload = self._speech_payload(reply, session_id=session.session_id)
         self.events.publish(
             make_event(
                 "hermes.status",
@@ -2493,7 +2509,7 @@ class XRAgentApp:
                 },
             )
         )
-        _, summary_payload = self._speech_payload(summary)
+        _, summary_payload = self._speech_payload(summary, session_id=updated.session_id)
         self.events.publish(make_event("assistant.reply", updated.session_id, summary_payload))
         self.events.publish(make_event("agent.summary", updated.session_id, summary_payload))
 

@@ -1852,6 +1852,18 @@ function controllerForHand(runtime: StageRuntime, handedness: XRHandedness): THR
   );
 }
 
+function xrInputSourceForHand(runtime: StageRuntime, handedness: XRHandedness): XRInputSource | null {
+  const sessionInputSources = runtime.world.session?.inputSources;
+  if (sessionInputSources) {
+    for (const inputSource of Array.from(sessionInputSources)) {
+      if (inputSource.handedness === handedness && inputSource.gamepad) {
+        return inputSource;
+      }
+    }
+  }
+  return controllerInputSource(controllerForHand(runtime, handedness));
+}
+
 function bestGamepadAxisPair(gamepad: Gamepad | null | undefined): { x: number; y: number } | null {
   const axes = gamepad?.axes;
   if (!axes || axes.length < 2) {
@@ -1859,7 +1871,7 @@ function bestGamepadAxisPair(gamepad: Gamepad | null | undefined): { x: number; 
   }
   let best: { x: number; y: number } | null = null;
   let bestMagnitude = 0;
-  for (let index = 0; index < axes.length - 1; index += 2) {
+  for (let index = 0; index < axes.length - 1; index += 1) {
     const x = axes[index] ?? 0;
     const y = axes[index + 1] ?? 0;
     const magnitude = Math.abs(x) + Math.abs(y);
@@ -1869,6 +1881,14 @@ function bestGamepadAxisPair(gamepad: Gamepad | null | undefined): { x: number; 
     }
   }
   return best;
+}
+
+function dominantJoystickDirection(axes: { x: number; y: number } | null): 1 | -1 | 0 {
+  if (!axes) {
+    return 0;
+  }
+  const strongestAxis = Math.abs(axes.x) >= Math.abs(axes.y) ? axes.x : axes.y;
+  return Math.abs(strongestAxis) >= XR_JOYSTICK_AXIS_THRESHOLD ? (strongestAxis > 0 ? 1 : -1) : 0;
 }
 
 function roundRect(
@@ -3901,16 +3921,17 @@ export function ImmersiveHermesStage({
     }
 
     const now = performance.now();
-    const leftAxes = bestGamepadAxisPair(controllerInputSource(controllerForHand(runtime, "left"))?.gamepad);
-    const leftX = leftAxes?.x ?? 0;
-    if (Math.abs(leftX) >= XR_JOYSTICK_AXIS_THRESHOLD && now >= xrJoystickPanelNextAtRef.current) {
-      cycleXrSelectedPanel(leftX > 0 ? 1 : -1);
+    const leftAxes = bestGamepadAxisPair(xrInputSourceForHand(runtime, "left")?.gamepad);
+    const leftDirection = dominantJoystickDirection(leftAxes);
+    const leftMagnitude = Math.max(Math.abs(leftAxes?.x ?? 0), Math.abs(leftAxes?.y ?? 0));
+    if (leftDirection !== 0 && now >= xrJoystickPanelNextAtRef.current) {
+      cycleXrSelectedPanel(leftDirection);
       xrJoystickPanelNextAtRef.current = now + XR_JOYSTICK_REPEAT_MS;
-    } else if (Math.abs(leftX) <= XR_JOYSTICK_AXIS_RELEASE) {
+    } else if (leftMagnitude <= XR_JOYSTICK_AXIS_RELEASE) {
       xrJoystickPanelNextAtRef.current = Math.min(xrJoystickPanelNextAtRef.current, now);
     }
 
-    const rightAxes = bestGamepadAxisPair(controllerInputSource(controllerForHand(runtime, "right"))?.gamepad);
+    const rightAxes = bestGamepadAxisPair(xrInputSourceForHand(runtime, "right")?.gamepad);
     const rightY = rightAxes?.y ?? 0;
     if (Math.abs(rightY) >= XR_JOYSTICK_AXIS_THRESHOLD && now >= xrJoystickScrollNextAtRef.current) {
       scrollXrSelectedPanel(rightY > 0 ? 1 : -1);
