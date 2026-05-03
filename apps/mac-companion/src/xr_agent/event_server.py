@@ -19,6 +19,8 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 
 class EventServer:
+    _REPLAY_EXCLUDED_TYPES = {"session.output", "terminal.output", "terminal.screen"}
+
     def __init__(self, max_events: int = 100) -> None:
         self._events: deque[AgentEvent] = deque(maxlen=max_events)
         self._events_lock = threading.Lock()
@@ -154,7 +156,10 @@ class EventServer:
         with self._subscribers_lock:
             self._subscribers.add(queue)
         with self._events_lock:
-            replay_events = [event for event in self._events if event.event_type != "session.output"]
+            replay_events = [
+                event for event in self._events
+                if event.event_type not in self._REPLAY_EXCLUDED_TYPES
+            ]
         sender_task: asyncio.Task[None] | None = None
         try:
             sender_task = asyncio.create_task(self._send_queue_messages(websocket, queue))

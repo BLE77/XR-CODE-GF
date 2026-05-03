@@ -49,6 +49,12 @@ def test_route_list_coding_sessions() -> None:
     assert command.intent == "list_coding_sessions"
 
 
+def test_route_active_worker_attention_summary() -> None:
+    router = CommandRouter()
+    command = router.route("what needs me next across the active workers?")
+    assert command.intent == "list_coding_sessions"
+
+
 def test_route_send_to_claude_session() -> None:
     router = CommandRouter()
     command = router.route("tell claude fix the auth bug")

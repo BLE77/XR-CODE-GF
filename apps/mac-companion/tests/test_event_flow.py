@@ -1,3 +1,4 @@
+import base64
 import sys
 import time
 
@@ -42,6 +43,32 @@ def test_voice_command_messages_are_routed_through_app_handler(tmp_path) -> None
 
     assert "speech.transcript" in event_types
     assert "agent.summary" in event_types
+
+
+def test_voice_audio_messages_are_transcribed_and_routed(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    app.speech.transcribe_audio = lambda audio, mime_type=None: "what happened?"
+
+    app.handle_client_message(
+        {
+            "type": "voice.audio",
+            "payload": {
+                "audio_base64": base64.b64encode(b"fake-webm-audio").decode("ascii"),
+                "mime_type": "audio/webm",
+                "repo_path": str(tmp_path),
+            },
+        }
+    )
+
+    events = app.events.recent_serialized()
+
+    assert any(event["type"] == "hermes.status" for event in events)
+    assert any(
+        event["type"] == "speech.transcript" and event["payload"]["text"] == "what happened?"
+        for event in events
+    )
+    assert any(event["type"] == "assistant.reply" for event in events)
 
 
 def test_what_happened_emits_assistant_reply(tmp_path) -> None:

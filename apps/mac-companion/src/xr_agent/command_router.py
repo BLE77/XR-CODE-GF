@@ -102,6 +102,11 @@ class CommandRouter:
             or "list coding sessions" in lowered
             or "what coding sessions are open" in lowered
             or "show terminals" in lowered
+            or "active workers" in lowered
+            or "active worker" in lowered
+            or "what needs me next" in lowered
+            or "what needs attention" in lowered
+            or "what needs my attention" in lowered
         ):
             return RoutedCommand(intent="list_coding_sessions", raw_text=text)
         if "fix" in lowered and "rerun" in lowered:

@@ -136,6 +136,27 @@ def test_event_server_replays_buffered_events_and_streams_new_ones() -> None:
         server.stop_in_background()
 
 
+def test_event_server_does_not_replay_noisy_terminal_frames() -> None:
+    server = EventServer()
+    server.publish(make_event("terminal.screen", "term-1", {"screen_text": "spinner"}))
+    server.publish(make_event("terminal.output", "term-1", {"line": "tick"}))
+    server.publish(make_event("assistant.reply", None, {"text": "Ready."}))
+    server.start_in_background("127.0.0.1", 0)
+    port = server.bound_port
+    assert port is not None
+
+    async def scenario() -> None:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            replay = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+            assert replay["type"] == "assistant.reply"
+            assert replay["payload"] == {"text": "Ready."}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.stop_in_background()
+
+
 def test_event_server_routes_client_messages_to_handler() -> None:
     server = EventServer()
     received: list[dict[str, object]] = []

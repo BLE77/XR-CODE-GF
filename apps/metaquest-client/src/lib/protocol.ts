@@ -156,12 +156,16 @@ export function isHighSignalEvent(event: AgentWireEvent): boolean {
     case "worker.pending_question":
     case "terminal.finished":
     case "terminal.failed":
+    case "terminal.started":
+    case "session.started":
+    case "session.finished":
+    case "session.failed":
     case "project.selected":
       return true;
     case "worker.updated": {
       const phase = payloadText(event.payload, "worker_phase") ?? "";
       return (
-        ["waiting_on_user", "blocked", "done", "needs_review"].includes(phase) ||
+        ["opening", "working", "waiting_on_user", "blocked", "done", "needs_review"].includes(phase) ||
         payloadBool(event.payload, "waiting_on_user") === true ||
         payloadBool(event.payload, "needs_review") === true
       );

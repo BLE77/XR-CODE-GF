@@ -111,7 +111,7 @@ class ManagedCodingSessionManager:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._screens: dict[str, "_AnsiScreenBuffer"] = {}
         self._threads: dict[str, threading.Thread] = {}
-        self._auto_confirmed_trust: set[str] = set()
+        self._auto_confirmed_prompts: set[str] = set()
 
     def start_session(
         self,
@@ -160,7 +160,8 @@ class ManagedCodingSessionManager:
 
         master_fd, slave_fd = pty.openpty()
         env = os.environ.copy()
-        env.setdefault("TERM", "xterm-256color")
+        if not env.get("TERM") or env.get("TERM") == "dumb":
+            env["TERM"] = "xterm-256color"
         env.setdefault("COLORTERM", "truecolor")
         _set_pty_window_size(slave_fd, rows=self.screen_rows, columns=self.screen_columns)
 
@@ -235,6 +236,39 @@ class ManagedCodingSessionManager:
         payload = clean_text.replace("\r\n", "\r").replace("\n", "\r") + "\r"
         os.write(master_fd, payload.encode("utf-8"))
         return session
+
+    def wait_until_ready_for_input(
+        self,
+        session_id: str,
+        *,
+        timeout: float = 5.0,
+        stable_for: float = 0.2,
+    ) -> ManagedCodingSession:
+        deadline = time.monotonic() + max(0.0, timeout)
+        last_text = ""
+        last_changed_at = time.monotonic()
+
+        while True:
+            session = self._require_session(session_id)
+            if session.status not in {SessionStatus.STARTING, SessionStatus.RUNNING}:
+                return session
+
+            visible_text = session.screen_text or "\n".join(session.output_tail or [])
+            normalized_text = _normalized_prompt_text(visible_text)
+            compact_text = _compact_prompt_text(normalized_text)
+            prompt_pending = self._auto_accept_prompt_pending(session, normalized_text, compact_text)
+            now = time.monotonic()
+
+            if normalized_text and not prompt_pending:
+                if normalized_text != last_text:
+                    last_text = normalized_text
+                    last_changed_at = now
+                elif now - last_changed_at >= stable_for:
+                    return session
+
+            if now >= deadline:
+                return session
+            time.sleep(0.05)
 
     def open_session_log_in_terminal(self, session_id: str) -> ManagedCodingSession:
         session = self._require_session(session_id)
@@ -345,7 +379,7 @@ class ManagedCodingSessionManager:
                     pass
             self._masters.clear()
             self._screens.clear()
-            self._auto_confirmed_trust.clear()
+            self._auto_confirmed_prompts.clear()
 
     def _resolve_tool(self, intent: str) -> CodingSessionTool:
         try:
@@ -421,7 +455,9 @@ class ManagedCodingSessionManager:
             master_fd = self._masters.pop(session_id, None)
             self._processes.pop(session_id, None)
             self._screens.pop(session_id, None)
-            self._auto_confirmed_trust.discard(session_id)
+            self._auto_confirmed_prompts = {
+                marker for marker in self._auto_confirmed_prompts if not marker.startswith(f"{session_id}:")
+            }
         if master_fd is not None:
             try:
                 os.close(master_fd)
@@ -496,8 +532,6 @@ class ManagedCodingSessionManager:
     ) -> None:
         if not session.auto_accept_trust_dialog:
             return
-        if session.session_id in self._auto_confirmed_trust:
-            return
 
         prompt_text = _normalized_prompt_text(
             "\n".join(
@@ -513,38 +547,46 @@ class ManagedCodingSessionManager:
         confirmation_bytes: bytes | None = None
         log_line: str | None = None
         notice_text: str | None = None
+        prompt_key: str | None = None
+        trust_prompt_visible = _claude_trust_prompt_visible(prompt_text)
+        bypass_prompt_visible = _claude_bypass_prompt_visible(compact_prompt_text)
 
-        if (
-            "quick safety check" in prompt_text
-            and "yes, i trust this folder" in prompt_text
-            and "enter to confirm" in prompt_text
-        ):
-            confirmation_bytes = b"\r"
-            log_line = "[auto-accepted claude trust prompt]"
-            notice_text = "Hermes approved Claude's trust prompt and Claude is continuing."
-        elif (
-            "bypasspermissionsmode" in compact_prompt_text
-            and "yesiaccept" in compact_prompt_text
-            and "entertoconfirm" in compact_prompt_text
-        ):
+        if bypass_prompt_visible and f"{session.session_id}:bypass-permissions" not in self._auto_confirmed_prompts:
             # Current Claude CLI warning defaults to "No, exit", so we move to
             # the accept option before confirming.
+            prompt_key = "bypass-permissions"
             confirmation_bytes = b"\x1b[B\r"
             log_line = "[auto-accepted claude bypass-permissions prompt]"
             notice_text = "Hermes approved Claude's bypass-permissions prompt and Claude is continuing."
+        elif trust_prompt_visible and f"{session.session_id}:trust" not in self._auto_confirmed_prompts:
+            prompt_key = "trust"
+            confirmation_bytes = b"\r"
+            log_line = "[auto-accepted claude trust prompt]"
+            notice_text = "Hermes approved Claude's trust prompt and Claude is continuing."
 
-        if confirmation_bytes is None:
+        if confirmation_bytes is None or prompt_key is None:
             return
 
         try:
             os.write(master_fd, confirmation_bytes)
-            self._auto_confirmed_trust.add(session.session_id)
+            self._auto_confirmed_prompts.add(f"{session.session_id}:{prompt_key}")
             if log_line is not None:
                 self._append_log_lines(session.session_id, [log_line])
             if on_notice is not None and notice_text is not None:
                 on_notice(session, notice_text)
         except OSError:
             return
+
+    def _auto_accept_prompt_pending(self, session: ManagedCodingSession, prompt_text: str, compact_prompt_text: str) -> bool:
+        trust_pending = (
+            _claude_trust_prompt_visible(prompt_text)
+            and f"{session.session_id}:trust" not in self._auto_confirmed_prompts
+        )
+        bypass_pending = (
+            _claude_bypass_prompt_visible(compact_prompt_text)
+            and f"{session.session_id}:bypass-permissions" not in self._auto_confirmed_prompts
+        )
+        return trust_pending or bypass_pending
 
     def _require_session(self, session_id: str) -> ManagedCodingSession:
         session = self.get(session_id)
@@ -616,6 +658,22 @@ def _normalized_prompt_text(text: str) -> str:
 
 def _compact_prompt_text(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _claude_trust_prompt_visible(prompt_text: str) -> bool:
+    return (
+        "quick safety check" in prompt_text
+        and "yes, i trust this folder" in prompt_text
+        and "enter to confirm" in prompt_text
+    )
+
+
+def _claude_bypass_prompt_visible(compact_prompt_text: str) -> bool:
+    return (
+        "bypasspermissionsmode" in compact_prompt_text
+        and "yesiaccept" in compact_prompt_text
+        and "entertoconfirm" in compact_prompt_text
+    )
 
 
 def _parse_csi_numbers(values: str) -> list[int]:
