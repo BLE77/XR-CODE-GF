@@ -3,6 +3,7 @@ import json
 import threading
 import time
 
+import pytest
 import websockets
 
 from xr_agent.config import AppConfig
@@ -155,6 +156,85 @@ def test_event_server_does_not_replay_noisy_terminal_frames() -> None:
         asyncio.run(scenario())
     finally:
         server.stop_in_background()
+
+
+def test_event_server_does_not_replay_terminal_output() -> None:
+    server = EventServer()
+    server.publish(make_event("terminal.output", "term-1", {"line": "tick"}))
+    server.publish(make_event("agent.summary", None, {"text": "Ready."}))
+    server.start_in_background("127.0.0.1", 0)
+    port = server.bound_port
+    assert port is not None
+
+    async def scenario() -> None:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            replay = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+            assert replay["type"] == "agent.summary"
+            assert replay["payload"] == {"text": "Ready."}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.stop_in_background()
+
+
+def test_event_server_does_not_replay_terminal_screen() -> None:
+    server = EventServer()
+    server.publish(make_event("terminal.screen", "term-1", {"screen_text": "spinner"}))
+    server.publish(make_event("agent.summary", None, {"text": "Ready."}))
+    server.start_in_background("127.0.0.1", 0)
+    port = server.bound_port
+    assert port is not None
+
+    async def scenario() -> None:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            replay = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+            assert replay["type"] == "agent.summary"
+            assert replay["payload"] == {"text": "Ready."}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.stop_in_background()
+
+
+def test_event_server_streams_audio_payload_live_but_does_not_replay_it() -> None:
+    server = EventServer()
+    server.start_in_background("127.0.0.1", 0)
+    port = server.bound_port
+    assert port is not None
+
+    async def scenario() -> None:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            server.publish(
+                make_event(
+                    "assistant.reply",
+                    None,
+                    {"text": "Ready.", "audio_base64": "ZmFrZQ==", "audio_mime_type": "audio/mpeg"},
+                )
+            )
+            live = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+            assert live["type"] == "assistant.reply"
+            assert live["payload"]["audio_base64"] == "ZmFrZQ=="
+
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as websocket:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(websocket.recv(), timeout=0.2)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.stop_in_background()
+
+
+def test_event_server_replay_history_strips_oversized_fields() -> None:
+    server = EventServer()
+    server.publish(make_event("agent.summary", None, {"text": "x" * 50000}))
+    stored = server.recent_serialized()[0]
+
+    assert stored["type"] == "agent.summary"
+    assert len(stored["payload"]["text"]) < 50000
+    assert "stripped oversized text" in stored["payload"]["text"]
 
 
 def test_event_server_routes_client_messages_to_handler() -> None:

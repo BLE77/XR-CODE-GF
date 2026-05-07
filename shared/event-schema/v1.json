@@ -3,6 +3,7 @@
   "title": "XR Coding Agent Event",
   "type": "object",
   "required": ["type", "ts", "payload"],
+  "additionalProperties": false,
   "properties": {
     "type": {
       "type": "string",
@@ -27,17 +28,329 @@
         "worker.updated",
         "worker.pending_question",
         "coding_sessions.synced",
+        "voice.realtime.session",
+        "voice.realtime.sdp.answer",
         "agent.summary"
       ]
     },
     "ts": {
-      "type": "string"
+      "type": "string",
+      "format": "date-time"
     },
     "session_id": {
       "type": ["string", "null"]
     },
     "payload": {
       "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "coding_sessions.synced" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/codingSessionsSyncedPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["terminal.started", "terminal.finished", "terminal.failed"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/terminalLifecyclePayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "terminal.output" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/terminalOutputPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "terminal.screen" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/terminalScreenPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["assistant.reply", "avatar.speaking", "agent.summary", "hermes.status"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/speechOrStatusPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["worker.updated", "worker.pending_question"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/workerPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "voice.realtime.session" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/realtimeSessionPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "const": "voice.realtime.sdp.answer" }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/realtimeSdpAnswerPayload" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sessionStatus": {
+      "type": "string",
+      "enum": ["starting", "running", "finished", "failed"]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "workerPayload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "worker_label": { "type": "string" },
+        "status_text": { "type": "string" },
+        "repo_path": { "type": "string" },
+        "title": { "type": "string" },
+        "intent": { "type": "string" },
+        "task_title": { "type": "string" },
+        "worker_phase": { "type": "string" },
+        "waiting_on_user": { "type": "boolean" },
+        "needs_review": { "type": "boolean" },
+        "manager_summary": { "type": "string" },
+        "blocked_reason": { "type": "string" },
+        "pending_question": { "type": "string" },
+        "question": { "type": "string" },
+        "decision_type": { "type": "string" },
+        "last_update": { "type": "string" }
+      }
+    },
+    "terminalLifecyclePayload": {
+      "allOf": [
+        { "$ref": "#/$defs/workerPayload" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "title": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "command": { "type": "string" },
+            "pid": { "type": ["integer", "null"] },
+            "exit_code": { "type": ["integer", "null"] },
+            "summary": { "type": "string" },
+            "log_path": { "$ref": "#/$defs/nullableString" }
+          }
+        }
+      ]
+    },
+    "terminalOutputPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/workerPayload" },
+        {
+          "type": "object",
+          "required": ["line"],
+          "additionalProperties": true,
+          "properties": {
+            "title": { "type": "string" },
+            "line": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "log_path": { "$ref": "#/$defs/nullableString" }
+          }
+        }
+      ]
+    },
+    "terminalScreenPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/workerPayload" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "title": { "type": "string" },
+            "repo_path": { "type": "string" },
+            "command": { "type": "string" },
+            "log_path": { "$ref": "#/$defs/nullableString" },
+            "screen_text": { "type": ["string", "null"] },
+            "screen_rows": { "type": ["integer", "null"] },
+            "screen_columns": { "type": ["integer", "null"] }
+          }
+        }
+      ]
+    },
+    "speechOrStatusPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/workerPayload" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "text": { "type": "string" },
+            "summary": { "type": "string" },
+            "duration_ms": { "type": "integer" },
+            "speech_turn_id": { "type": "string" },
+            "speech_delivery": { "type": "string" },
+            "audio_base64": { "type": "string" },
+            "audio_base64_stripped": { "type": "boolean" },
+            "audio_base64_marker": { "type": "string" },
+            "audio_mime_type": { "type": "string" },
+            "audio_byte_count": { "type": "integer" },
+            "backend_audio_pending": { "type": "boolean" },
+            "voice_provider": { "type": "string" },
+            "voice_id": { "type": "string" },
+            "voice_name": { "type": "string" },
+            "voice_model_id": { "type": "string" },
+            "voice_transport": { "type": "string" },
+            "voice_latency_mode": { "type": "string" },
+            "voice_synthesis_ms": { "type": "integer" },
+            "phase": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "codingSessionSnapshot": {
+      "type": "object",
+      "required": [
+        "session_id",
+        "intent",
+        "title",
+        "tool_label",
+        "repo_path",
+        "status",
+        "phase",
+        "waiting_on_user",
+        "needs_review",
+        "output_summary",
+        "output_line_count",
+        "started_at",
+        "snapshot_at"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "session_id": { "type": "string" },
+        "intent": { "type": "string" },
+        "title": { "type": "string" },
+        "tool_label": { "type": "string" },
+        "repo_path": { "type": "string" },
+        "command": { "type": "string" },
+        "status": { "$ref": "#/$defs/sessionStatus" },
+        "phase": { "type": "string" },
+        "pid": { "type": ["integer", "null"] },
+        "exit_code": { "type": ["integer", "null"] },
+        "summary": { "$ref": "#/$defs/nullableString" },
+        "log_path": { "$ref": "#/$defs/nullableString" },
+        "worker_label": { "$ref": "#/$defs/nullableString" },
+        "task_title": { "$ref": "#/$defs/nullableString" },
+        "worker_phase": { "type": "string" },
+        "status_text": { "type": "string" },
+        "manager_summary": { "$ref": "#/$defs/nullableString" },
+        "waiting_on_user": { "type": "boolean" },
+        "needs_review": { "type": "boolean" },
+        "blocked_reason": { "$ref": "#/$defs/nullableString" },
+        "pending_question": { "$ref": "#/$defs/nullableString" },
+        "last_update": { "$ref": "#/$defs/nullableString" },
+        "output_summary": { "type": "string" },
+        "output_line_count": { "type": "integer" },
+        "has_screen": { "type": "boolean" },
+        "screen_rows": { "type": ["integer", "null"] },
+        "screen_columns": { "type": ["integer", "null"] },
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" },
+        "snapshot_at": { "type": "string", "format": "date-time" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["screen_text"] },
+          { "required": ["output_tail"] },
+          { "required": ["audio_base64"] }
+        ]
+      }
+    },
+    "codingSessionsSyncedPayload": {
+      "type": "object",
+      "required": ["snapshot_version", "snapshot_at", "session_count", "live_count", "sessions", "complete"],
+      "additionalProperties": true,
+      "properties": {
+        "snapshot_version": { "type": "integer" },
+        "snapshot_at": { "type": "string", "format": "date-time" },
+        "session_count": { "type": "integer" },
+        "live_count": { "type": "integer" },
+        "sessions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/codingSessionSnapshot" }
+        },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "realtimeSessionPayload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "request_id": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "client_secret": { "type": "string" },
+        "expires_at": {},
+        "model": { "type": "string" },
+        "voice": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    },
+    "realtimeSdpAnswerPayload": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "request_id": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "provider": { "type": "string" },
+        "sdp": { "type": "string" },
+        "error": { "type": "string" }
+      }
     }
   }
 }

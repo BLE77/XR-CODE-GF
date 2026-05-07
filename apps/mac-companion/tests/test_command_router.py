@@ -31,6 +31,18 @@ def test_route_open_up_codex_project_session() -> None:
     assert command.intent == "open_codex"
 
 
+def test_route_open_kimi_code_session() -> None:
+    router = CommandRouter()
+    command = router.route("open kimi code here")
+    assert command.intent == "open_kimi_code"
+
+
+def test_route_open_kimi_session_from_voice_variant() -> None:
+    router = CommandRouter()
+    command = router.route("launch kimmy in the hackathon repo")
+    assert command.intent == "open_kimi_code"
+
+
 def test_route_polite_open_claude_session() -> None:
     router = CommandRouter()
     command = router.route("can you please open up claude in the mac companion project for me")
@@ -46,6 +58,12 @@ def test_route_open_claude_session_from_quad_code_transcript() -> None:
 def test_route_list_coding_sessions() -> None:
     router = CommandRouter()
     command = router.route("what coding sessions are open")
+    assert command.intent == "list_coding_sessions"
+
+
+def test_route_open_agents_to_worker_board() -> None:
+    router = CommandRouter()
+    command = router.route("open agents")
     assert command.intent == "list_coding_sessions"
 
 
@@ -73,9 +91,26 @@ def test_route_have_claude_send_to_session() -> None:
     assert command.content == "inspect the auth bug"
 
 
+def test_route_send_to_kimi_session() -> None:
+    router = CommandRouter()
+    command = router.route("tell kimi inspect the xr ui")
+
+    assert command.intent == "send_to_coding_session"
+    assert command.target == "open_kimi_code"
+    assert command.content == "inspect the xr ui"
+
+
 def test_route_summarize_codex_session() -> None:
     router = CommandRouter()
     command = router.route("what is codex doing")
 
     assert command.intent == "summarize_coding_session"
     assert command.target == "open_codex"
+
+
+def test_route_summarize_kimi_session() -> None:
+    router = CommandRouter()
+    command = router.route("what is kimi doing")
+
+    assert command.intent == "summarize_coding_session"
+    assert command.target == "open_kimi_code"

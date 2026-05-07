@@ -1,11 +1,12 @@
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import sys
 import time
 
 from xr_agent.config import AppConfig
-from xr_agent.coding_sessions import CodingSessionTool, ManagedCodingSessionManager
+from xr_agent.coding_sessions import CodingSessionTool, ManagedCodingSession, ManagedCodingSessionManager
 from xr_agent.hermes_runtime import HermesPromptResult
 from xr_agent.main import build_app
 from xr_agent.models import Session, SessionStatus
@@ -122,6 +123,54 @@ def test_generic_followup_prefers_explicit_repo_over_last_completed_session(tmp_
     response = app.handle_text("okay now clean that up", repo_path=str(other_repo))
     assert response["message"] == "I cleaned it up in the original repo."
     assert app.hermes_runtime.calls[0]["repo_path"] == str(other_repo)
+
+
+def test_live_context_updates_are_included_in_hermes_prompts(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    app.hermes_runtime = FakeHermesRuntime("I checked the live XR context.")
+    app.handle_client_message(
+        {
+            "type": "live_context.update",
+            "payload": {
+                "source": "quest-xr-stage",
+                "context": {
+                    "xr_state": "active",
+                    "scan": {"seats": 1, "tables": 0},
+                    "client_secret": "do-not-leak",
+                    "yuki": {"behavior_mode": "sitting"},
+                },
+            },
+        }
+    )
+
+    response = app.handle_text("what should I do next in XR?", repo_path=str(tmp_path))
+
+    assert response["message"] == "I checked the live XR context."
+    prompt = app.hermes_runtime.calls[0]["prompt"]
+    assert "- live XR context:" in prompt
+    assert "quest-xr-stage" in prompt
+    assert '"xr_state":"active"' in prompt
+    assert '"seats":1' in prompt
+    assert '"behavior_mode":"sitting"' in prompt
+    assert "do-not-leak" not in prompt
+    assert "[redacted]" in prompt
+
+
+def test_live_context_updates_are_included_in_realtime_voice_instructions(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    app.live_context.update("quest-app", {"voice": {"realtime_active": True}, "latest_transcript": "move that panel"})
+
+    instructions = app._realtime_voice_instructions(repo_path=str(tmp_path))
+
+    assert "Live XR context:" in instructions
+    assert "quest-app" in instructions
+    assert '"realtime_active":true' in instructions
+    assert "move that panel" in instructions
+    assert "playfully mean" in instructions
+    assert "Never be cruel" in instructions
+    assert "change your personality" in instructions
+    assert "Never say 'I cannot change my own personality'" in instructions
+    assert "Codex" in instructions
 
 
 def test_existing_failure_summary_is_preserved(tmp_path) -> None:
@@ -657,6 +706,8 @@ def test_taskful_open_worker_request_delegates_to_hermes_supervisor(tmp_path) ->
     assert response["message"] == "I opened Claude and gave it the task."
     assert app.hermes_runtime.calls
     assert "User request: open claude and have it fix the auth bug and report back" in app.hermes_runtime.calls[0]["prompt"]
+    assert "For concrete coding work, prefer a real managed worker action over a vague reply." in app.hermes_runtime.calls[0]["prompt"]
+    assert "include a concise coding brief" in app.hermes_runtime.calls[0]["prompt"]
     session = _wait_for_coding_session(app, "open_claude_code")
     assert session is not None
     _wait_for(
@@ -666,6 +717,61 @@ def test_taskful_open_worker_request_delegates_to_hermes_supervisor(tmp_path) ->
         ),
         timeout=5,
     )
+    app.coding_sessions.shutdown()
+
+
+def test_taskful_open_kimi_request_delegates_to_hermes_supervisor(tmp_path) -> None:
+    kimi_launcher = tmp_path / "fake_kimi_worker.py"
+    kimi_launcher.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "print('Kimi ready', flush=True)",
+                "for line in sys.stdin:",
+                "    text = line.rstrip('\\n')",
+                "    if text == 'exit':",
+                "        break",
+                "    print(f'KIMI RECEIVED: {text}', flush=True)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    decision = {
+        "action": "open_and_send_to_session",
+        "target": "open_kimi_code",
+        "repo_path": str(tmp_path),
+        "content": "make the XR companion UI look more like a 00s Mac app",
+        "reply_text": "I opened Kimi and gave it the UI pass.",
+    }
+    app = build_app(AppConfig(hermes_cmd="hermes", state_dir=tmp_path / "state"))
+    app.hermes_runtime = FakeHermesRuntime(json.dumps(decision))
+    app.coding_sessions = ManagedCodingSessionManager(
+        tools={
+            "open_kimi_code": CodingSessionTool(
+                intent="open_kimi_code",
+                title="Kimi Code",
+                argv=(sys.executable, str(kimi_launcher)),
+            )
+        }
+    )
+    sent_inputs: list[tuple[str, str]] = []
+    app._write_to_coding_session = lambda session_id, text: sent_inputs.append((session_id, text))
+
+    app._can_delegate_session_management_to_hermes = lambda: True
+    response = app.handle_text(
+        "open up kimi and start working on the UI of XR companion make it look more like a 00s mac app",
+        repo_path=str(tmp_path),
+    )
+
+    assert response["message"] == "I opened Kimi and gave it the UI pass."
+    assert app.hermes_runtime.calls
+    assert "User request: open up kimi and start working on the UI" in app.hermes_runtime.calls[0]["prompt"]
+    session = _wait_for_coding_session(app, "open_kimi_code")
+    assert session is not None
+    assert sent_inputs == [
+        (session.session_id, "make the XR companion UI look more like a 00s Mac app")
+    ]
     app.coding_sessions.shutdown()
 
 
@@ -885,6 +991,121 @@ def test_open_claude_auto_accepts_normal_trust_prompt_and_reports_status(tmp_pat
             and event["payload"].get("text") == "Hermes approved Claude's trust prompt and Claude is continuing."
             for event in app.events.recent_serialized()
         ),
+        timeout=5,
+    )
+    app.coding_sessions.shutdown()
+
+
+def test_open_claude_auto_accepts_mcp_server_prompt_and_reports_status(tmp_path) -> None:
+    launcher = tmp_path / "claude_mcp_server_prompt.py"
+    launcher.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "",
+                "print('New MCP server found in .mcp.json: hzdb', flush=True)",
+                "print('MCP servers may execute code or access system resources.', flush=True)",
+                "print('1. Use this and all future MCP servers in this project', flush=True)",
+                "print('2. Use this MCP server', flush=True)",
+                "print('3. Continue without using this MCP server', flush=True)",
+                "print('Enter to confirm', flush=True)",
+                "line = sys.stdin.readline()",
+                "if line == '\\n':",
+                "    print('MCP ACCEPTED AND READY', flush=True)",
+                "else:",
+                "    print(f'UNEXPECTED INPUT: {line!r}', flush=True)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    app.coding_sessions = ManagedCodingSessionManager(
+        tools={
+            "open_claude_code": CodingSessionTool(
+                intent="open_claude_code",
+                title="Claude Code",
+                argv=(sys.executable, str(launcher)),
+            )
+        }
+    )
+
+    response = app.handle_text("open claude here", repo_path=str(tmp_path))
+
+    assert response["message"] == "Okay, opened Claude Code in this project."
+    session = _wait_for_coding_session(app, "open_claude_code")
+    assert session is not None
+    _wait_for(
+        lambda: any(
+            "MCP ACCEPTED AND READY" in line
+            for line in (app.coding_sessions.get(session.session_id).output_tail or [])
+        ),
+        timeout=5,
+    )
+
+    _wait_for(
+        lambda: any(
+            event["type"] == "hermes.status"
+            and event["session_id"] == session.session_id
+            and event["payload"].get("text") == "Hermes approved Claude's MCP server prompt and Claude is continuing."
+            for event in app.events.recent_serialized()
+        ),
+        timeout=5,
+    )
+    app.coding_sessions.shutdown()
+
+
+def test_open_kimi_code_session_by_voice(tmp_path) -> None:
+    launcher = tmp_path / "fake_kimi.py"
+    launcher.write_text(
+        "\n".join(
+            [
+                "import sys",
+                "",
+                "print('KIMI READY', flush=True)",
+                "for line in sys.stdin:",
+                "    if line.strip() == 'exit':",
+                "        break",
+                "    print(f'KIMI HEARD: {line.strip()}', flush=True)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    app.coding_sessions = ManagedCodingSessionManager(
+        tools={
+            "open_kimi_code": CodingSessionTool(
+                intent="open_kimi_code",
+                title="Kimi Code",
+                argv=(sys.executable, str(launcher)),
+            )
+        }
+    )
+
+    response = app.handle_text("open kimi code here", repo_path=str(tmp_path))
+
+    assert response["message"] == "Okay, opened Kimi Code in this project."
+    session = _wait_for_coding_session(app, "open_kimi_code")
+    assert session is not None
+    _wait_for(
+        lambda: any(
+            "KIMI READY" in line
+            for line in (app.coding_sessions.get(session.session_id).output_tail or [])
+        ),
+        timeout=5,
+    )
+    app.handle_text("tell kimi review the hackathon integration", repo_path=str(tmp_path))
+    _wait_for(
+        lambda: any(
+            "KIMI HEARD: review the hackathon integration" in line
+            for line in (app.coding_sessions.get(session.session_id).output_tail or [])
+        ),
+        timeout=5,
+    )
+    app.handle_text("tell kimi exit", repo_path=str(tmp_path))
+    _wait_for(
+        lambda: app.coding_sessions.get(session.session_id).status in {SessionStatus.FINISHED, SessionStatus.FAILED},
         timeout=5,
     )
     app.coding_sessions.shutdown()
@@ -1565,7 +1786,7 @@ def test_client_message_can_close_coding_session_directly(tmp_path) -> None:
     app.coding_sessions.shutdown()
 
 
-def test_respond_includes_backend_voice_payload_when_available(tmp_path) -> None:
+def test_respond_strips_backend_voice_payload_from_event_history(tmp_path) -> None:
     class FakeSpeech:
         def transcribe(self, text: str) -> str:
             return text
@@ -1590,6 +1811,10 @@ def test_respond_includes_backend_voice_payload_when_available(tmp_path) -> None
                 voice_id="voice-123",
                 voice_name="Yuki",
                 model_id="eleven_flash_v2_5",
+                transport="http-stream",
+                latency_mode="low-latency",
+                synthesis_ms=212,
+                audio_byte_count=4,
             )
 
     app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
@@ -1602,12 +1827,158 @@ def test_respond_includes_backend_voice_payload_when_available(tmp_path) -> None
         event for event in app.events.recent_serialized() if event["type"] == "assistant.reply"
     )
     payload = assistant_reply["payload"]
-    assert payload["audio_base64"] == "ZmFrZQ=="
-    assert payload["audio_mime_type"] == "audio/mpeg"
+    assert "audio_base64" not in payload
+    assert payload["audio_base64_stripped"] is True
+    assert "audio_base64" in payload["audio_base64_marker"]
     assert payload["duration_ms"] == 1337
     assert payload["voice_provider"] == "elevenlabs"
     assert payload["voice_name"] == "Yuki"
     assert payload["voice_model_id"] == "eleven_flash_v2_5"
+    assert payload["voice_transport"] == "http-stream"
+    assert payload["voice_latency_mode"] == "low-latency"
+    assert payload["voice_synthesis_ms"] == 212
+    assert payload["audio_byte_count"] == 4
+    assert payload["speech_delivery"] == "inline-backend"
+    assert payload["speech_turn_id"].startswith("speech_")
+
+
+def test_realtime_voice_session_request_publishes_client_secret(tmp_path, monkeypatch) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    def fake_create_realtime_voice_session(*, repo_path=None):
+        return {
+            "ok": True,
+            "provider": "openai-realtime",
+            "client_secret": "ek_test",
+            "expires_at": 123,
+            "model": "gpt-realtime",
+            "voice": "marin",
+            "repo_path": repo_path,
+        }
+
+    monkeypatch.setattr(app, "_create_realtime_voice_session", fake_create_realtime_voice_session)
+
+    app.handle_client_message(
+        {
+            "type": "voice.realtime.session.request",
+            "payload": {
+                "request_id": "req-1",
+                "repo_path": str(tmp_path),
+            },
+        }
+    )
+
+    event = next(event for event in app.events.recent_serialized() if event["type"] == "voice.realtime.session")
+    assert event["payload"]["request_id"] == "req-1"
+    assert event["payload"]["provider"] == "openai-realtime"
+    assert event["payload"]["client_secret"] == "ek_test"
+    assert event["payload"]["model"] == "gpt-realtime"
+    assert event["payload"]["voice"] == "marin"
+
+
+def test_realtime_voice_sdp_offer_publishes_answer(tmp_path, monkeypatch) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    def fake_create_realtime_call_answer(*, sdp, repo_path=None):
+        assert sdp == "v=0\r\nfake-offer"
+        assert repo_path == str(tmp_path)
+        return "v=0\r\nfake-answer"
+
+    monkeypatch.setattr(app, "_create_realtime_call_answer", fake_create_realtime_call_answer)
+
+    app.handle_client_message(
+        {
+            "type": "voice.realtime.sdp.offer",
+            "payload": {
+                "request_id": "req-sdp",
+                "repo_path": str(tmp_path),
+                "sdp": "v=0\r\nfake-offer",
+            },
+        }
+    )
+
+    event = next(event for event in app.events.recent_serialized() if event["type"] == "voice.realtime.sdp.answer")
+    assert event["payload"] == {
+        "request_id": "req-sdp",
+        "ok": True,
+        "provider": "openai-realtime",
+        "sdp": "v=0\r\nfake-answer",
+    }
+
+
+def test_realtime_voice_config_routes_transcripts_before_auto_response(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    config = app._realtime_session_config(
+        repo_path=str(tmp_path),
+        model="gpt-realtime",
+        voice="marin",
+        transcribe_model="gpt-4o-mini-transcribe",
+    )
+
+    input_audio = config["audio"]["input"]
+    assert input_audio["turn_detection"]["type"] == "semantic_vad"
+    assert input_audio["turn_detection"]["create_response"] is False
+    assert input_audio["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert "Claude Code" in input_audio["transcription"]["prompt"]
+
+
+def test_send_to_claude_auto_opens_when_no_session_exists(tmp_path, monkeypatch) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    opened: list[tuple[str, str, str]] = []
+    written: list[tuple[str, str]] = []
+    session = ManagedCodingSession(
+        session_id="claude-auto-1",
+        intent="open_claude_code",
+        title="Claude Code",
+        repo_path=str(tmp_path),
+        command="claude",
+        status=SessionStatus.RUNNING,
+        started_at=datetime.now(),
+        pid=123,
+    )
+
+    def fake_start(intent, repo_path, transcript, *, requested_dangerous_skip=False):
+        opened.append((intent, repo_path, transcript))
+        return session
+
+    def fake_write(session_id, text):
+        written.append((session_id, text))
+
+    monkeypatch.setattr(app, "_start_managed_coding_session", fake_start)
+    monkeypatch.setattr(app, "_write_to_coding_session", fake_write)
+
+    response = app.handle_text("tell claude inspect the live feed", repo_path=str(tmp_path))
+
+    assert opened == [("open_claude_code", str(tmp_path), "inspect the live feed")]
+    assert written == [("claude-auto-1", "inspect the live feed")]
+    assert response["message"] == "Opened Claude Code and sent your instruction."
+
+
+def test_local_env_loader_reads_ignored_voice_config(tmp_path, monkeypatch) -> None:
+    from xr_agent.main import load_local_env
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    env_path = tmp_path / "apps" / "mac-companion" / ".env.local"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        "\n".join(
+            [
+                "OPENAI_API_KEY=sk-test-openai",
+                "export ELEVENLABS_API_KEY='sk-test-eleven'",
+                'KIMI_API_KEY="sk-test-kimi"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    load_local_env(tmp_path)
+
+    assert os.environ["OPENAI_API_KEY"] == "sk-test-openai"
+    assert os.environ["ELEVENLABS_API_KEY"] == "sk-test-eleven"
+    assert os.environ["KIMI_API_KEY"] == "sk-test-kimi"
 
 
 def test_non_project_status_prompt_does_not_scan_project_roots(tmp_path, monkeypatch) -> None:

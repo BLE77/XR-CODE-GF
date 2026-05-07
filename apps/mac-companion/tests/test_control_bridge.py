@@ -127,7 +127,7 @@ def test_handle_control_request_validates_errors(tmp_path) -> None:
             }
         )
         assert invalid_tool["ok"] is False
-        assert "tool=claude, codex, or hermes" in invalid_tool["error"]
+        assert "tool=claude, codex, hermes, or kimi" in invalid_tool["error"]
 
         opened = app.handle_control_request(
             {

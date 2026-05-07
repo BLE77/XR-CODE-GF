@@ -12,17 +12,17 @@ _POLITE_PREFIX_PATTERN = re.compile(
 _SEND_CONTENT_PREFIX_PATTERN = re.compile(r"^(?:to\s+)", re.IGNORECASE)
 
 _SEND_TO_SESSION_PATTERN = re.compile(
-    r"^(?:ask|tell|send to|message|continue|have|get)\s+(claude|codex|hermes)\b[: ,.-]*(.*)$",
+    r"^(?:ask|tell|send to|message|continue|have|get)\s+(claude|codex|hermes|kimi|kimmy|kimmie)\b[: ,.-]*(.*)$",
     re.IGNORECASE,
 )
 
 _SUMMARIZE_SESSION_PATTERN = re.compile(
-    r"^(?:what is|what's|what did|summarize|check on)\s+(claude|codex|hermes)\b(?:\s+(?:doing|working on|up to|session|status))?.*$",
+    r"^(?:what is|what's|what did|summarize|check on)\s+(claude|codex|hermes|kimi|kimmy|kimmie)\b(?:\s+(?:doing|working on|up to|session|status))?.*$",
     re.IGNORECASE,
 )
 
 _CLOSE_SESSION_PATTERN = re.compile(
-    r"^(?:close|quit|exit|stop)\s+(claude|codex|hermes)\b(?:\s+(?:code|session|terminal))?.*$",
+    r"^(?:close|quit|exit|stop)\s+(claude|codex|hermes|kimi|kimmy|kimmie)\b(?:\s+(?:code|session|terminal))?.*$",
     re.IGNORECASE,
 )
 
@@ -41,6 +41,20 @@ _OPEN_HERMES_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_OPEN_KIMI_PATTERN = re.compile(
+    r"\b(?:open(?: up)?|start(?: up)?|launch|spin up|boot up)\b.*\b(?:kimi|kimmy|kimmie)(?:\s+code)?\b",
+    re.IGNORECASE,
+)
+
+_TOOL_INTENT_BY_SPOKEN_NAME = {
+    "claude": "open_claude_code",
+    "codex": "open_codex",
+    "hermes": "open_hermes_cli",
+    "kimi": "open_kimi_code",
+    "kimmy": "open_kimi_code",
+    "kimmie": "open_kimi_code",
+}
+
 
 class CommandRouter:
     def route(self, text: str) -> RoutedCommand:
@@ -51,11 +65,7 @@ class CommandRouter:
         if send_match:
             tool_name = send_match.group(1).lower()
             content = _SEND_CONTENT_PREFIX_PATTERN.sub("", send_match.group(2).strip())
-            target = {
-                "claude": "open_claude_code",
-                "codex": "open_codex",
-                "hermes": "open_hermes_cli",
-            }[tool_name]
+            target = _TOOL_INTENT_BY_SPOKEN_NAME[tool_name]
             return RoutedCommand(
                 intent="send_to_coding_session",
                 raw_text=text,
@@ -66,11 +76,7 @@ class CommandRouter:
         summarize_match = _SUMMARIZE_SESSION_PATTERN.match(normalized)
         if summarize_match:
             tool_name = summarize_match.group(1).lower()
-            target = {
-                "claude": "open_claude_code",
-                "codex": "open_codex",
-                "hermes": "open_hermes_cli",
-            }[tool_name]
+            target = _TOOL_INTENT_BY_SPOKEN_NAME[tool_name]
             return RoutedCommand(
                 intent="summarize_coding_session",
                 raw_text=text,
@@ -80,11 +86,7 @@ class CommandRouter:
         close_match = _CLOSE_SESSION_PATTERN.match(normalized)
         if close_match:
             tool_name = close_match.group(1).lower()
-            target = {
-                "claude": "open_claude_code",
-                "codex": "open_codex",
-                "hermes": "open_hermes_cli",
-            }[tool_name]
+            target = _TOOL_INTENT_BY_SPOKEN_NAME[tool_name]
             return RoutedCommand(
                 intent="close_coding_session",
                 raw_text=text,
@@ -97,11 +99,17 @@ class CommandRouter:
             return RoutedCommand(intent="open_claude_code", raw_text=text)
         if _OPEN_HERMES_PATTERN.search(normalized):
             return RoutedCommand(intent="open_hermes_cli", raw_text=text)
+        if _OPEN_KIMI_PATTERN.search(normalized):
+            return RoutedCommand(intent="open_kimi_code", raw_text=text)
         if (
             "open coding sessions" in lowered
             or "list coding sessions" in lowered
             or "what coding sessions are open" in lowered
             or "show terminals" in lowered
+            or "open agents" in lowered
+            or "open workers" in lowered
+            or "show agents" in lowered
+            or "show workers" in lowered
             or "active workers" in lowered
             or "active worker" in lowered
             or "what needs me next" in lowered

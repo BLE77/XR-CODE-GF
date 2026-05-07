@@ -112,6 +112,14 @@ The Quest client reuses the existing runtime payloads rather than inventing Ques
 - `terminal.finished`
 - `terminal.failed`
 
+Reconnect contract:
+
+- websocket replay excludes `session.output`, `terminal.output`, `terminal.screen`, `avatar.speaking`, OpenAI Realtime secrets/SDP answers, and any event whose stored payload had `audio_base64`
+- oversized event fields are truncated or replaced with explicit stripped markers by the Mac companion before queue/history storage
+- the worker board sends `coding_sessions.sync` after connect and treats `coding_sessions.synced.payload.sessions` as authoritative compact backend state
+- `coding_sessions.synced` snapshots include IDs, tool/worker labels, repo path, status, phase, pending question, manager summary, small output summary, and timestamps
+- sync snapshots must not contain `screen_text`, `output_tail`, or `audio_base64`; live terminal frames are for already-connected clients only
+
 ## Additive backend change in this branch
 
 One small, backward-compatible websocket message was added for targeted Quest approvals:
@@ -140,4 +148,28 @@ This keeps worker approval and rejection routed through backend manager state in
 - browser voice input support depends on Quest Browser speech APIs
 - browser speech output is generic TTS, not backend-owned voice synthesis or true viseme timing
 - room-aware MR and stronger scene understanding still need a deeper platform pass
-- the shared event schema file in `shared/event-schema/v1.json` lags behind the runtime event set and should be refreshed
+- keep `shared/event-schema/v1.json` in sync when adding new backend event types or snapshot fields
+
+## Low-latency ElevenLabs voice
+
+The Mac companion defaults backend Yuki speech to the ElevenLabs streaming TTS endpoint when `ELEVENLABS_API_KEY` is set.
+
+Recommended low-latency settings:
+
+- `ELEVENLABS_MODEL_ID=eleven_flash_v2_5`
+- `ELEVENLABS_TTS_MODE=streaming`
+- `ELEVENLABS_OUTPUT_FORMAT=mp3_22050_32`
+- `ELEVENLABS_VOICE_ID=<your-yuki-voice-id>`
+
+Set `ELEVENLABS_TTS_MODE=timestamps` only when alignment timing matters more than response latency. Setting `ELEVENLABS_VOICE_ID` avoids a first-turn voice lookup by name.
+
+## Realtime OpenAI voice
+
+For live voice-to-voice, the Quest client creates a WebRTC offer and the Mac companion completes the OpenAI Realtime SDP exchange server-side. Keep the real API key only on the Mac companion:
+
+- `OPENAI_API_KEY=<your OpenAI API key>`
+- `OPENAI_REALTIME_MODEL=gpt-realtime-1.5`
+- `OPENAI_REALTIME_VOICE=marin`
+- `OPENAI_REALTIME_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
+
+The headset never receives the real API key. Tapping the XR mic starts/stops the Realtime session; coding actions are routed back to the local Hermes supervisor with the `route_to_hermes` realtime tool.

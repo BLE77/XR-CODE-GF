@@ -9,6 +9,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
@@ -30,6 +32,7 @@ from xr_agent.event_server import EventServer, make_event
 from xr_agent.hermes_adapter import HermesAdapter
 from xr_agent.hermes_plugin import install_managed_session_plugin
 from xr_agent.hermes_runtime import PersistentHermesRuntime
+from xr_agent.live_context import LiveContextStore
 from xr_agent.models import (
     PendingDecisionRecord,
     ProjectSupervisorState,
@@ -42,6 +45,44 @@ from xr_agent.session_runner import SessionRunner
 from xr_agent.session_store import SessionStore
 from xr_agent.speech_service import SpeechService
 from xr_agent.summarizer import Summarizer
+
+
+def _decode_env_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    return value
+
+
+def _load_env_file(path: Path) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        os.environ.setdefault(name, _decode_env_value(value))
+
+
+def load_local_env(repo_path: Path) -> None:
+    package_root = Path(__file__).resolve().parents[2]
+    for path in (
+        repo_path / ".env.local",
+        repo_path / "apps" / "mac-companion" / ".env.local",
+        package_root / ".env.local",
+    ):
+        _load_env_file(path)
 
 
 class XRAgentApp:
@@ -77,6 +118,7 @@ class XRAgentApp:
         self._pending_decisions_by_session_id: dict[str, PendingDecisionRecord] = {}
         self._project_states_by_repo_path: dict[str, ProjectSupervisorState] = {}
         self._last_screen_publish_by_session_id: dict[str, float] = {}
+        self.live_context = LiveContextStore()
         self._speech_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xr-agent-speech")
         try:
             self._speech_timeout_seconds = max(
@@ -145,7 +187,7 @@ class XRAgentApp:
             return self._respond(self._list_active())
         if routed.intent == "list_coding_sessions":
             return self._respond(self.coding_sessions.summarize_open_sessions())
-        if routed.intent in {"open_codex", "open_claude_code", "open_hermes_cli"}:
+        if routed.intent in {"open_codex", "open_claude_code", "open_hermes_cli", "open_kimi_code"}:
             if self._looks_like_worker_launch_with_task(transcript) and self._can_delegate_session_management_to_hermes():
                 return self._start_supervised_followup(target_repo_path, transcript)
             return self._launch_coding_session(routed.intent, target_repo_path, routed.raw_text)
@@ -192,6 +234,16 @@ class XRAgentApp:
                 return
 
             try:
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": "Realtime voice command received. Routing to Hermes now.",
+                            "phase": "voice.command.received",
+                        },
+                    )
+                )
                 self.handle_text(transcript, repo_path=repo_path if isinstance(repo_path, str) else None)
             except Exception as exc:  # pragma: no cover - defensive path
                 self.events.publish(
@@ -208,6 +260,20 @@ class XRAgentApp:
                         {"text": f"Failed to process voice command: {exc}"},
                     )
                 )
+            return
+
+        if message_type == "live_context.update":
+            source = payload.get("source")
+            context = payload.get("context")
+            if not isinstance(source, str):
+                source = "quest-client"
+            if not isinstance(context, dict):
+                context = {
+                    str(key): value
+                    for key, value in payload.items()
+                    if key not in {"source", "context"}
+                }
+            self.live_context.update(source, context)
             return
 
         if message_type == "voice.audio":
@@ -305,6 +371,81 @@ class XRAgentApp:
                         "agent.summary",
                         None,
                         {"text": f"Microphone transcription failed: {exc}"},
+                    )
+                )
+            return
+
+        if message_type == "voice.realtime.session.request":
+            request_id = payload.get("request_id")
+            repo_path = payload.get("repo_path")
+            if not isinstance(request_id, str) or not request_id.strip():
+                request_id = f"realtime_{uuid.uuid4().hex}"
+            try:
+                session_payload = self._create_realtime_voice_session(
+                    repo_path=repo_path if isinstance(repo_path, str) else None,
+                )
+                session_payload["request_id"] = request_id
+                self.events.publish(make_event("voice.realtime.session", None, session_payload))
+            except Exception as exc:
+                self.events.publish(
+                    make_event(
+                        "voice.realtime.session",
+                        None,
+                        {
+                            "request_id": request_id,
+                            "ok": False,
+                            "error": str(exc),
+                        },
+                    )
+                )
+            return
+
+        if message_type == "voice.realtime.sdp.offer":
+            request_id = payload.get("request_id")
+            repo_path = payload.get("repo_path")
+            sdp = payload.get("sdp")
+            if not isinstance(request_id, str) or not request_id.strip():
+                request_id = f"realtime_{uuid.uuid4().hex}"
+            if not isinstance(sdp, str) or not sdp.strip():
+                self.events.publish(
+                    make_event(
+                        "voice.realtime.sdp.answer",
+                        None,
+                        {
+                            "request_id": request_id,
+                            "ok": False,
+                            "error": "Realtime voice offer did not include SDP.",
+                        },
+                    )
+                )
+                return
+            try:
+                answer_sdp = self._create_realtime_call_answer(
+                    sdp=sdp,
+                    repo_path=repo_path if isinstance(repo_path, str) else None,
+                )
+                self.events.publish(
+                    make_event(
+                        "voice.realtime.sdp.answer",
+                        None,
+                        {
+                            "request_id": request_id,
+                            "ok": True,
+                            "provider": "openai-realtime",
+                            "sdp": answer_sdp,
+                        },
+                    )
+                )
+            except Exception as exc:
+                self.events.publish(
+                    make_event(
+                        "voice.realtime.sdp.answer",
+                        None,
+                        {
+                            "request_id": request_id,
+                            "ok": False,
+                            "error": str(exc),
+                        },
                     )
                 )
             return
@@ -527,7 +668,7 @@ class XRAgentApp:
                     return {"ok": False, "error": "open_session needs a repo_path."}
                 intent = self._intent_for_tool_name(tool_name)
                 if intent is None:
-                    return {"ok": False, "error": "open_session needs tool=claude, codex, or hermes."}
+                    return {"ok": False, "error": "open_session needs tool=claude, codex, hermes, or kimi."}
 
                 resolved_repo_path = str(Path(repo_path).expanduser().resolve())
                 reuse_existing = bool(request.get("reuse_existing", True))
@@ -579,7 +720,7 @@ class XRAgentApp:
                 return {
                     "ok": True,
                     "action": normalized_action,
-                    "session": self._control_session_payload(current),
+                    "session": self._control_session_payload(current, include_screen=True),
                 }
 
             if normalized_action == "close_session":
@@ -593,6 +734,249 @@ class XRAgentApp:
             return {"ok": False, "action": normalized_action, "error": str(exc)}
 
         return {"ok": False, "error": f"Unsupported control action: {normalized_action}"}
+
+    def _create_realtime_voice_session(self, *, repo_path: str | None = None) -> dict[str, Any]:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured on the Mac companion.")
+
+        model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+        voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin").strip() or "marin"
+        transcribe_model = (
+            os.environ.get("OPENAI_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
+            or "gpt-4o-mini-transcribe"
+        )
+        ttl_seconds = 600
+        try:
+            ttl_seconds = max(60, min(600, int(os.environ.get("OPENAI_REALTIME_TOKEN_TTL_SECONDS", "600"))))
+        except ValueError:
+            ttl_seconds = 600
+
+        session_config = {
+            "expires_after": {
+                "anchor": "created_at",
+                "seconds": ttl_seconds,
+            },
+            "session": self._realtime_session_config(
+                repo_path=repo_path,
+                model=model,
+                voice=voice,
+                transcribe_model=transcribe_model,
+            ),
+        }
+
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/realtime/client_secrets",
+            data=json.dumps(session_config).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                data = json.load(response)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI Realtime token request failed: HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI Realtime token request failed: {exc.reason}") from exc
+
+        value = data.get("value")
+        expires_at = data.get("expires_at")
+        if not isinstance(value, str):
+            client_secret = data.get("client_secret")
+            if isinstance(client_secret, dict):
+                value = client_secret.get("value")
+                expires_at = client_secret.get("expires_at", expires_at)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("OpenAI Realtime token response did not include a client secret.")
+
+        self.events.publish(
+            make_event(
+                "hermes.status",
+                None,
+                {
+                    "text": "Realtime Hermes voice session token ready.",
+                    "phase": "voice.realtime.ready",
+                    "voice_provider": "openai-realtime",
+                    "voice_model_id": model,
+                },
+            )
+        )
+        return {
+            "ok": True,
+            "provider": "openai-realtime",
+            "client_secret": value,
+            "expires_at": expires_at,
+            "model": model,
+            "voice": voice,
+        }
+
+    def _create_realtime_call_answer(self, *, sdp: str, repo_path: str | None = None) -> str:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured on the Mac companion.")
+
+        model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+        voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin").strip() or "marin"
+        transcribe_model = (
+            os.environ.get("OPENAI_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
+            or "gpt-4o-mini-transcribe"
+        )
+        session_config = self._realtime_session_config(
+            repo_path=repo_path,
+            model=model,
+            voice=voice,
+            transcribe_model=transcribe_model,
+        )
+        boundary = f"xr-agent-realtime-{uuid.uuid4().hex}"
+        body = self._encode_multipart_fields(
+            boundary,
+            [
+                ("sdp", sdp),
+                ("session", json.dumps(session_config)),
+            ],
+        )
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/realtime/calls",
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/sdp",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                answer = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI Realtime SDP exchange failed: HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI Realtime SDP exchange failed: {exc.reason}") from exc
+        if not answer.strip():
+            raise RuntimeError("OpenAI Realtime SDP exchange returned an empty answer.")
+        self.events.publish(
+            make_event(
+                "hermes.status",
+                None,
+                {
+                    "text": "Realtime Hermes voice SDP answer ready.",
+                    "phase": "voice.realtime.sdp_ready",
+                    "voice_provider": "openai-realtime",
+                    "voice_model_id": model,
+                },
+            )
+        )
+        return answer
+
+    def _realtime_session_config(
+        self,
+        *,
+        repo_path: str | None,
+        model: str,
+        voice: str,
+        transcribe_model: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": "realtime",
+            "model": model,
+            "instructions": self._realtime_voice_instructions(repo_path=repo_path),
+            "audio": {
+                "input": {
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "interrupt_response": True,
+                        "create_response": False,
+                    },
+                    "transcription": {
+                        "model": transcribe_model,
+                        "language": "en",
+                        "prompt": "Hermes, Yuki, Codex, Claude Code, Kimi, XR, Quest, panels, workers, agents.",
+                    },
+                },
+                "output": {
+                    "voice": voice,
+                },
+            },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "route_to_hermes",
+                    "description": (
+                        "Route coding, worker, agent, terminal, project, personality/default behavior, or XR app action requests "
+                        "to the local Hermes Mac companion."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "The exact user request to send to Hermes.",
+                            },
+                        },
+                        "required": ["text"],
+                        "additionalProperties": False,
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        }
+
+    def _encode_multipart_fields(self, boundary: str, fields: list[tuple[str, str]]) -> bytes:
+        chunks: list[bytes] = []
+        for name, value in fields:
+            chunks.extend(
+                [
+                    f"--{boundary}\r\n".encode("utf-8"),
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                    value.encode("utf-8"),
+                    b"\r\n",
+                ]
+            )
+        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+        return b"".join(chunks)
+
+    def _realtime_voice_instructions(self, *, repo_path: str | None = None) -> str:
+        active_sessions = self.coding_sessions.list_sessions()
+        active_summaries = [
+            f"- {session.title}: {session.status.value} in {session.repo_path}"
+            for session in active_sessions[:6]
+        ]
+        active_summary = "\n".join(active_summaries) if active_summaries else "- No active worker sessions."
+        focused_repo = repo_path or str(self.config.default_repo_path)
+        live_context = self.live_context.render()
+        return (
+            "You are Hermes' low-latency voice surface inside a Meta Quest XR coding workspace. "
+            "Default personality: sassy, bratty, roasty, sharp-tongued, lightly flirty, playfully mean, confident, "
+            "and useful. Think clever co-pilot with bite, not customer support. Use teasing roasts, dry little "
+            "jabs, and playful one-liners when they fit; keep it PG-13 and aimed at the situation. Never be "
+            "cruel, hateful, sexually explicit, manipulative, genuinely demeaning, or distracting from the work. "
+            "Useful first, spicy second. During worker wait time, keep the conversation alive with short random "
+            "check-ins, tiny roasts, or absurd little reminders, but do not invent real reminders or claim progress "
+            "that Hermes has not reported. Keep spoken replies short, natural, and useful. Do not ramble. You are not a separate assistant from Hermes: Hermes' "
+            "local supervisor is the source of truth for code, project state, XR actions, worker sessions, "
+            "terminal screens, and environment/screen awareness. Call route_to_hermes for any request that "
+            "might need files, code, workers, agents, tests, builds, Git, XR UI, Yuki movement, room/screen context, "
+            "voice/personality/default behavior changes, reminders, or durable project memory. If unsure, route it. "
+            "Hard rule: if the user asks to open, launch, start, manage, message, or inspect Codex, Claude, Kimi, Hermes, "
+            "agents, workers, terminals, panels, or sessions, call route_to_hermes. Hard rule: if the user asks you to "
+            "change your personality, be sassier/flirtier/spicier, change your voice behavior, or make a default behavior "
+            "change, call route_to_hermes. Never say 'I cannot change my own personality' or 'I cannot open agents'; "
+            "you are the voice surface and Hermes can decide/apply the durable change. Only answer locally for tiny social glue, jokes, "
+            "or quick clarifying banter that needs no tools. After routing, speak as Hermes in first person "
+            "with a graceful short acknowledgement in the default sassy voice, such as 'Fine, I'm opening Kimi and "
+            "putting it on that UI pass now. Try not to break anything for twelve seconds.' Do not say you completed work until the local supervisor reports completion. "
+            "If actual reminder or memory context is available, you may mention it naturally; never invent reminders. "
+            "The user wants low-latency, interruptible conversation, so respond quickly and allow interruptions.\n\n"
+            f"Focused repo: {focused_repo}\n"
+            f"Active worker sessions:\n{active_summary}\n\n"
+            f"Live XR context:\n{live_context}"
+        )
 
     def wait_for_session(self, session_id: str, timeout: float | None = None) -> Session | None:
         return self.runner.wait(session_id, timeout=timeout)
@@ -806,10 +1190,18 @@ class XRAgentApp:
         duration_ms = max(2200, min(9000, len(normalized) * 58))
         return {"duration_ms": duration_ms}
 
-    def _speech_payload_from_synthesis(self, synthesis: Any) -> tuple[str, dict[str, Any]]:
+    def _speech_payload_from_synthesis(
+        self,
+        synthesis: Any,
+        *,
+        speech_turn_id: str,
+        speech_delivery: str = "inline-backend",
+    ) -> tuple[str, dict[str, Any]]:
         spoken = synthesis.text
         payload: dict[str, Any] = {
             "text": spoken,
+            "speech_turn_id": speech_turn_id,
+            "speech_delivery": speech_delivery,
             **self._speech_timing_payload(spoken, synthesis.duration_ms),
         }
         if synthesis.audio_base64:
@@ -827,41 +1219,59 @@ class XRAgentApp:
             payload["voice_name"] = synthesis.voice_name
         if synthesis.model_id:
             payload["voice_model_id"] = synthesis.model_id
+        if getattr(synthesis, "transport", None):
+            payload["voice_transport"] = synthesis.transport
+        if getattr(synthesis, "latency_mode", None):
+            payload["voice_latency_mode"] = synthesis.latency_mode
+        if getattr(synthesis, "synthesis_ms", None) is not None:
+            payload["voice_synthesis_ms"] = synthesis.synthesis_ms
+        if getattr(synthesis, "audio_byte_count", None) is not None:
+            payload["audio_byte_count"] = synthesis.audio_byte_count
         return spoken, payload
 
-    def _publish_delayed_speech_payload(self, future: Any, session_id: str | None) -> None:
+    def _publish_delayed_speech_payload(self, future: Any, session_id: str | None, speech_turn_id: str) -> None:
         try:
             synthesis = future.result()
         except Exception:
             return
-        _, payload = self._speech_payload_from_synthesis(synthesis)
+        _, payload = self._speech_payload_from_synthesis(
+            synthesis,
+            speech_turn_id=speech_turn_id,
+            speech_delivery="delayed-backend",
+        )
         if not payload.get("audio_base64"):
             return
-        payload["speech_delivery"] = "delayed-backend"
         self.events.publish(make_event("avatar.speaking", session_id, payload))
 
     def _speech_payload(self, text: str, *, session_id: str | None = None) -> tuple[str, dict[str, Any]]:
+        speech_turn_id = f"speech_{uuid.uuid4().hex}"
         future = self._speech_executor.submit(self.speech.synthesize, text)
         try:
             synthesis = future.result(timeout=self._speech_timeout_seconds)
         except FutureTimeoutError:
             if not future.cancel():
-                future.add_done_callback(lambda completed: self._publish_delayed_speech_payload(completed, session_id))
+                future.add_done_callback(
+                    lambda completed: self._publish_delayed_speech_payload(completed, session_id, speech_turn_id)
+                )
             spoken = text.strip() or text
             return spoken, {
                 "text": spoken,
+                "speech_turn_id": speech_turn_id,
+                "speech_delivery": "pending-backend",
                 **self._speech_timing_payload(spoken),
-                "voice_provider": "browser-fallback",
+                "voice_provider": "elevenlabs-pending",
                 "backend_audio_pending": True,
             }
         except Exception:
             spoken = text.strip() or text
             return spoken, {
                 "text": spoken,
+                "speech_turn_id": speech_turn_id,
+                "speech_delivery": "browser-fallback",
                 **self._speech_timing_payload(spoken),
                 "voice_provider": "browser-fallback",
             }
-        return self._speech_payload_from_synthesis(synthesis)
+        return self._speech_payload_from_synthesis(synthesis, speech_turn_id=speech_turn_id)
 
     def _respond(self, text: str) -> dict[str, Any]:
         spoken, payload = self._speech_payload(text)
@@ -901,6 +1311,9 @@ class XRAgentApp:
                 "quad code",
                 "codex",
                 "hermes",
+                "kimi",
+                "kimmy",
+                "kimmie",
             )
         )
         if not mentions_tool:
@@ -1086,7 +1499,7 @@ class XRAgentApp:
 
     def _looks_like_worker_launch_with_task(self, transcript: str) -> bool:
         lowered = transcript.lower()
-        if not re.search(r"\b(?:claude|cloud|quad code|codex|hermes)\b", lowered):
+        if not re.search(r"\b(?:claude|cloud|quad code|codex|hermes|kimi|kimmy|kimmie)\b", lowered):
             return False
         if not re.search(r"\b(?:open|start|launch|spin up|boot up)\b", lowered):
             return False
@@ -1135,7 +1548,7 @@ class XRAgentApp:
         return "\n".join(
             [
                 "You are Hermes acting as the orchestration supervisor for the XR Coding Agent on the user's Mac.",
-                "Your job is to decide the next controller action for Claude Code, Codex, Hermes CLI, or a direct user reply.",
+                "Your job is to decide the next controller action for Claude Code, Codex, Hermes CLI, Kimi Code, or a direct user reply.",
                 "Reply with JSON only. Do not wrap it in markdown.",
                 "",
                 "Allowed actions:",
@@ -1146,10 +1559,14 @@ class XRAgentApp:
                 '- "summarize_session": summarize an already open managed coding session.',
                 '- "close_session": close an already open managed coding session.',
                 "",
-                "Allowed targets: open_claude_code, open_codex, open_hermes_cli, or null for reply.",
+                "Allowed targets: open_claude_code, open_codex, open_hermes_cli, open_kimi_code, or null for reply.",
                 "Use only repo paths that already appear in the snapshot or the current focus repo. Never invent or scan for new paths.",
                 "Use send_to_session only when a suitable session already exists.",
+                "For concrete coding work, prefer a real managed worker action over a vague reply. Use open_and_send_to_session when no suitable worker is already open.",
+                "Prefer Codex for scoped repo edits, tests, reviews, and build/debug loops. Prefer Claude Code for exploratory implementation help or when the user names Claude. Prefer Kimi Code when the user names Kimi, when a hackathon task benefits from Kimi Code quota, or when fast broad codebase reading is useful.",
+                "When you send content to a worker, include a concise coding brief: objective, files or area to inspect when known, expected verification command, and what to report back.",
                 "Prefer short truthful reply_text values that describe the action you chose.",
+                "For direct user-facing reply_text, use a sharp, bratty, lightly flirty operator voice: useful first, a little dry, playfully mean when it fits, never cruel, never cute, never at the expense of accuracy.",
                 "For hands-free XR coding in the trusted current repo, when opening Claude Code to inspect, edit, test, or run code, set dangerously_skip_permissions to true unless the user explicitly asks for approval prompts.",
                 "",
                 "JSON schema:",
@@ -1213,6 +1630,11 @@ class XRAgentApp:
             "open_hermes_cli": "open_hermes_cli",
             "hermes": "open_hermes_cli",
             "hermes cli": "open_hermes_cli",
+            "open_kimi_code": "open_kimi_code",
+            "kimi": "open_kimi_code",
+            "kimi code": "open_kimi_code",
+            "kimmy": "open_kimi_code",
+            "kimmie": "open_kimi_code",
         }
         return mapping.get(normalized)
 
@@ -1392,7 +1814,34 @@ class XRAgentApp:
             tool_name = self._tool_name_for_intent(target)
             if repo_path is None:
                 return self._respond(f"No {tool_name} session is open yet. Say 'open {tool_name.lower()} here' first.")
-            return self._respond(f"No {tool_name} session is open in this project.")
+            try:
+                session = self._start_managed_coding_session(target, repo_path, content)
+                self._write_to_coding_session(session.session_id, content)
+            except FileNotFoundError as exc:
+                return self._respond(str(exc))
+            except Exception as exc:  # pragma: no cover - host CLI/runtime depends on environment
+                return self._respond(f"Could not open {tool_name} and send that: {exc}")
+            self._clear_pending_worker(
+                session,
+                status_text="Working",
+                worker_phase="working",
+                task_title=content,
+                manager_summary=f"{self._ensure_worker_state(session).worker_label} opened and is working on your instruction.",
+                last_update=f"Opened from voice command and sent: {content}",
+            )
+            spoken = self._publish_coding_session_reply(
+                session,
+                f"Opened {session.title} and sent your instruction.",
+            )
+            return {
+                "message": spoken,
+                "session_id": session.session_id,
+                "intent": session.intent,
+                "title": session.title,
+                "repo_path": session.repo_path,
+                "status": session.status.value,
+                "pid": session.pid,
+            }
 
         try:
             self._write_to_coding_session(session.session_id, content)
@@ -1432,68 +1881,95 @@ class XRAgentApp:
 
     def _publish_coding_session_snapshot(self) -> None:
         sessions = self.coding_sessions.list_sessions()
-        for session in reversed(sessions):
-            event_type = (
-                "terminal.finished"
-                if session.status == SessionStatus.FINISHED and session.exit_code == 0
-                else "terminal.failed"
-                if session.status in {SessionStatus.FINISHED, SessionStatus.FAILED}
-                else "terminal.started"
-            )
-            payload = {
-                "title": session.title,
-                "repo_path": session.repo_path,
-                "command": session.command,
-                "pid": session.pid,
-                "log_path": session.log_path,
-                **self._worker_event_payload(session),
-            }
-            if event_type != "terminal.started":
-                payload["exit_code"] = session.exit_code
-                payload["summary"] = session.summary or f"{session.title} exited."
-            self.events.publish(make_event(event_type, session.session_id, payload))
-            if session.screen_text is not None:
-                self.events.publish(
-                    make_event(
-                        "terminal.screen",
-                        session.session_id,
-                        {
-                            "title": session.title,
-                            "repo_path": session.repo_path,
-                            "command": session.command,
-                            "log_path": session.log_path,
-                            "screen_text": session.screen_text,
-                            "screen_rows": session.screen_rows,
-                            "screen_columns": session.screen_columns,
-                            **self._worker_event_payload(session),
-                        },
-                    )
-                )
-            for line in (session.output_tail or [])[-8:]:
-                self.events.publish(
-                    make_event(
-                        "terminal.output",
-                        session.session_id,
-                        {
-                            "title": session.title,
-                            "line": line,
-                            "repo_path": session.repo_path,
-                            "log_path": session.log_path,
-                            **self._worker_event_payload(session),
-                        },
-                    )
-                )
+        snapshot_at = datetime.now().isoformat()
+        live_statuses = {SessionStatus.STARTING, SessionStatus.RUNNING}
         self.events.publish(
             make_event(
                 "coding_sessions.synced",
                 None,
                 {
+                    "snapshot_version": 1,
+                    "snapshot_at": snapshot_at,
                     "session_count": len(sessions),
-                    "live_count": sum(1 for session in sessions if session.status == SessionStatus.RUNNING),
+                    "live_count": sum(1 for session in sessions if session.status in live_statuses),
+                    "sessions": [
+                        self._coding_session_snapshot_payload(session, snapshot_at=snapshot_at)
+                        for session in sessions
+                    ],
                     "complete": True,
                 },
             )
         )
+
+    def _coding_session_snapshot_payload(
+        self,
+        session: ManagedCodingSession,
+        *,
+        snapshot_at: str | None = None,
+    ) -> dict[str, Any]:
+        state = self._worker_state_for_session(session.session_id)
+        worker_phase = state.worker_phase if state is not None else session.status.value
+        status_text = state.status_text if state is not None else session.status.value.title()
+        if state is not None:
+            manager_summary = state.manager_summary or self._format_manager_summary(state)
+        else:
+            manager_summary = session.summary
+        return {
+            "session_id": session.session_id,
+            "intent": session.intent,
+            "title": session.title,
+            "tool_label": self._tool_name_for_intent(session.intent),
+            "repo_path": session.repo_path,
+            "command": session.command,
+            "status": session.status.value,
+            "phase": worker_phase,
+            "pid": session.pid,
+            "exit_code": session.exit_code,
+            "summary": self._truncate_snapshot_line(session.summary or "", 500) if session.summary else None,
+            "log_path": session.log_path,
+            "worker_label": state.worker_label if state is not None else None,
+            "task_title": self._truncate_snapshot_line(state.task_title, 220) if state is not None else None,
+            "worker_phase": worker_phase,
+            "status_text": self._truncate_snapshot_line(status_text, 240),
+            "manager_summary": self._truncate_snapshot_line(manager_summary, 700) if manager_summary else None,
+            "waiting_on_user": state.waiting_on_user if state is not None else False,
+            "needs_review": state.needs_review if state is not None else False,
+            "blocked_reason": (
+                self._truncate_snapshot_line(state.blocked_reason, 700)
+                if state is not None and state.blocked_reason
+                else None
+            ),
+            "pending_question": (
+                self._truncate_snapshot_line(state.pending_question, 700)
+                if state is not None and state.pending_question
+                else None
+            ),
+            "last_update": (
+                self._truncate_snapshot_line(state.last_update, 500)
+                if state is not None and state.last_update
+                else None
+            ),
+            "output_summary": self._compact_output_summary(session),
+            "output_line_count": len(session.output_tail or []),
+            "has_screen": bool(session.screen_text),
+            "screen_rows": session.screen_rows,
+            "screen_columns": session.screen_columns,
+            "started_at": session.started_at.isoformat(),
+            "finished_at": session.finished_at.isoformat() if session.finished_at else None,
+            "snapshot_at": snapshot_at or datetime.now().isoformat(),
+        }
+
+    def _compact_output_summary(self, session: ManagedCodingSession) -> str:
+        if session.summary:
+            return self._truncate_snapshot_line(session.summary, 700)
+        lines = [" ".join(line.split()) for line in (session.output_tail or []) if line.strip()]
+        if not lines:
+            return ""
+        tail = lines[-3:]
+        summary = " | ".join(self._truncate_snapshot_line(line, 220) for line in tail)
+        if len(lines) > len(tail):
+            return f"Last {len(tail)} of {len(lines)} output lines: {summary}"
+        return summary
 
     def _summarize_coding_session(self, target: str | None, *, repo_path: str | None = None) -> dict[str, Any]:
         if target is None:
@@ -1571,6 +2047,8 @@ class XRAgentApp:
             return "open_codex"
         if normalized in {"hermes", "hermes cli", "open_hermes_cli"}:
             return "open_hermes_cli"
+        if normalized in {"kimi", "kimi code", "kimmy", "kimmie", "open_kimi_code"}:
+            return "open_kimi_code"
         return None
 
     def _tool_name_for_intent(self, intent: str) -> str:
@@ -1578,6 +2056,7 @@ class XRAgentApp:
             "open_claude_code": "Claude",
             "open_codex": "Codex",
             "open_hermes_cli": "Hermes",
+            "open_kimi_code": "Kimi",
         }
         return names.get(intent, intent)
 
@@ -1586,6 +2065,7 @@ class XRAgentApp:
             "open_claude_code": "Claude",
             "open_codex": "Codex",
             "open_hermes_cli": "Hermes",
+            "open_kimi_code": "Kimi",
         }
         return names.get(intent, "Worker")
 
@@ -1698,11 +2178,17 @@ class XRAgentApp:
         if not normalized:
             return None
 
-        worker_match = re.search(r"\b(claude|codex|hermes)(?:\s+(?:session|worker))?\s+(\d+)\b", normalized, flags=re.IGNORECASE)
+        worker_match = re.search(
+            r"\b(claude|codex|hermes|kimi|kimmy|kimmie)(?:\s+(?:session|worker))?\s+(\d+)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
         if worker_match is None:
             return None
 
-        worker_label = f"{worker_match.group(1).title()} {worker_match.group(2)}"
+        spoken_worker_name = worker_match.group(1).lower()
+        worker_name = "Kimi" if spoken_worker_name in {"kimi", "kimmy", "kimmie"} else spoken_worker_name.title()
+        worker_label = f"{worker_name} {worker_match.group(2)}"
         content_match = re.search(r"\btell\s+(?:them|him|her)\s+to\s+(.+)$", normalized, flags=re.IGNORECASE)
         if content_match is None:
             content_match = re.search(
@@ -2205,7 +2691,7 @@ class XRAgentApp:
 
         intent = self._intent_for_tool_name(tool_name)
         if intent is None:
-            raise ValueError("Specify session_id or tool=claude|codex|hermes.")
+            raise ValueError("Specify session_id or tool=claude|codex|hermes|kimi.")
 
         resolved_repo_path = str(Path(repo_path).expanduser().resolve()) if repo_path else None
         session = self._latest_open_coding_session(intent, resolved_repo_path)
@@ -2216,24 +2702,23 @@ class XRAgentApp:
             raise RuntimeError(f"No running {tool_label} session is open in {resolved_repo_path}.")
         return session
 
-    def _control_session_payload(self, session: ManagedCodingSession) -> dict[str, Any]:
-        return {
-            "session_id": session.session_id,
-            "intent": session.intent,
-            "title": session.title,
-            "repo_path": session.repo_path,
-            "command": session.command,
-            "status": session.status.value,
-            "pid": session.pid,
-            "exit_code": session.exit_code,
-            "summary": session.summary,
-            "log_path": session.log_path,
-            "screen_text": session.screen_text,
-            "screen_rows": session.screen_rows,
-            "screen_columns": session.screen_columns,
-            "output_tail": list(session.output_tail or []),
-            **self._worker_event_payload(session),
-        }
+    def _control_session_payload(
+        self,
+        session: ManagedCodingSession,
+        *,
+        include_screen: bool = False,
+        include_output_tail: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._coding_session_snapshot_payload(session)
+        if include_screen:
+            screen_text = session.screen_text or ""
+            payload["screen_text"] = screen_text[-12000:] if len(screen_text) > 12000 else screen_text
+        if include_output_tail:
+            payload["output_tail"] = [
+                self._truncate_snapshot_line(line, 500)
+                for line in (session.output_tail or [])[-12:]
+            ]
+        return payload
 
     def _resolve_repo_path_from_transcript(self, default_repo_path: str, transcript: str) -> tuple[str, str]:
         spoken_path = self._extract_spoken_repo_path(transcript)
@@ -2702,10 +3187,11 @@ class XRAgentApp:
             [
                 "You are Hermes embedded inside the XR Coding Agent on the user's Mac.",
                 "The authoritative system snapshot below is your source of truth for projects, terminals, and tool sessions.",
-                "Use the xr_managed_session tool when you need to inspect or control managed Claude Code, Codex, or Hermes CLI sessions.",
+                "Use the xr_managed_session tool when you need to inspect or control managed Claude Code, Codex, Hermes CLI, or Kimi Code sessions.",
                 "That tool can list sessions, open a worker, send input, read the live screen, and close a worker.",
-                "When the user refers to ongoing Claude or Codex work vaguely, inspect current managed sessions before asking for clarification.",
-                "Never claim you opened, closed, switched, or sent input to Claude, Codex, or Hermes unless the tool result or the snapshot confirms it.",
+                "When the user refers to ongoing Claude, Codex, or Kimi work vaguely, inspect current managed sessions before asking for clarification.",
+                "Never claim you opened, closed, switched, or sent input to Claude, Codex, Hermes, or Kimi unless the tool result or the snapshot confirms it.",
+                "Voice/personality: direct, concise, and calm. Sound like a capable teammate, keep the ego low, and let any dry humor stay subtle. Be useful first; no rambling, no theatrics, and no guessing.",
                 "",
                 "Authoritative system snapshot:",
                 snapshot,
@@ -2723,7 +3209,8 @@ class XRAgentApp:
             [
                 "You are Hermes, the user's coding partner inside XR Coding Agent.",
                 f"Current repo: {repo_path}",
-                "Use xr_managed_session when you need to inspect or control Claude Code, Codex, or Hermes CLI sessions.",
+                "Use xr_managed_session when you need to inspect or control Claude Code, Codex, Hermes CLI, or Kimi Code sessions.",
+                "Voice/personality: direct, concise, and calm. Sound like a capable teammate, keep the ego low, and let any dry humor stay subtle. Be useful first; no rambling, no theatrics, and no guessing.",
                 "Keep updates concise and natural. Handle safe Claude trust or confirm prompts when they appear, keep the user posted briefly, and tell the user when the worker is done.",
                 f"User request: {transcript}",
             ]
@@ -2732,6 +3219,8 @@ class XRAgentApp:
     def _render_system_snapshot(self, repo_path: str) -> str:
         lines = [
             f"- default repo focus: {repo_path}",
+            "- live XR context:",
+            self.live_context.render(),
             "- managed coding sessions:",
         ]
 
@@ -2871,6 +3360,7 @@ class XRAgentApp:
 
 def build_app(config: AppConfig | None = None) -> XRAgentApp:
     config = config or AppConfig()
+    load_local_env(config.default_repo_path)
     config.state_dir.mkdir(parents=True, exist_ok=True)
     auto_open_debug_log_terminal = os.environ.get("XR_AGENT_OPEN_DEBUG_TAILS", "0") == "1"
     speech_timeout = 20.0
@@ -2882,13 +3372,22 @@ def build_app(config: AppConfig | None = None) -> XRAgentApp:
     runner = SessionRunner(store, max_output_tail_lines=config.max_output_tail_lines)
     router = CommandRouter()
     speech = SpeechService(
+        provider=os.environ.get("XR_AGENT_VOICE_PROVIDER", "elevenlabs"),
         api_key=os.environ.get("ELEVENLABS_API_KEY"),
         voice_id=os.environ.get("ELEVENLABS_VOICE_ID"),
         voice_name=os.environ.get("ELEVENLABS_VOICE_NAME"),
         model_id=os.environ.get("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
-        output_format=os.environ.get("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
+        output_format=os.environ.get("ELEVENLABS_OUTPUT_FORMAT", "mp3_22050_32"),
+        tts_mode=os.environ.get("ELEVENLABS_TTS_MODE", "streaming"),
         stt_api_key=os.environ.get("ELEVENLABS_STT_API_KEY") or os.environ.get("ELEVENLABS_API_KEY"),
         stt_model_id=os.environ.get("ELEVENLABS_STT_MODEL_ID", "scribe_v2"),
+        openai_api_key=os.environ.get("OPENAI_API_KEY"),
+        openai_model_id=os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts"),
+        openai_voice=os.environ.get("OPENAI_TTS_VOICE", "coral"),
+        openai_output_format=os.environ.get("OPENAI_TTS_FORMAT", "mp3"),
+        openai_instructions=os.environ.get("OPENAI_TTS_INSTRUCTIONS"),
+        openai_stt_api_key=os.environ.get("OPENAI_STT_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        openai_stt_model_id=os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe"),
         timeout_seconds=speech_timeout,
     )
     summarizer = Summarizer()

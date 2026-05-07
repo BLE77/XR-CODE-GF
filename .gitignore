@@ -12,8 +12,12 @@ xcuserdata/
 apps/visionos-client/Assets/Temp/
 
 # Local environment secrets
+.env
+.env.*
 .env.local
 apps/mac-companion/.env.local
+!.env.example
+!*.env.example
 
 # Local Quest browser/dev artifacts
 apps/metaquest-client/.certs/
@@ -21,3 +25,20 @@ apps/metaquest-client/.smoke-preview/
 .server-logs/
 .codex-cron/
 mac-command-center-hermes-os*.png
+
+# Local agent/tool configuration
+.mcp.json
+
+# Local certificates and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+
+# Local logs and databases
+*.log
+*.har
+*.sqlite
+*.sqlite3
+*.db

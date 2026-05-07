@@ -1,16 +1,25 @@
 import base64
 import sys
 import time
+from datetime import datetime
 
 from xr_agent.config import AppConfig
-from xr_agent.coding_sessions import CodingSessionTool, ManagedCodingSessionManager
+from xr_agent.coding_sessions import CodingSessionTool, ManagedCodingSession, ManagedCodingSessionManager
+from xr_agent.event_server import EventServer
 from xr_agent.main import build_app, parse_args
+from xr_agent.models import SessionStatus
 
 
 def test_parse_args_supports_show_events_flag() -> None:
     args = parse_args(["--repo", "/tmp/demo", "--once", "run tests", "--show-events"])
 
     assert args.show_events is True
+
+
+def test_event_replay_excludes_large_voice_payloads() -> None:
+    assert "avatar.speaking" in EventServer._REPLAY_EXCLUDED_TYPES
+    assert "voice.realtime.session" in EventServer._REPLAY_EXCLUDED_TYPES
+    assert "voice.realtime.sdp.answer" in EventServer._REPLAY_EXCLUDED_TYPES
 
 
 def test_run_tests_emits_session_and_summary_events(tmp_path) -> None:
@@ -95,9 +104,67 @@ def test_coding_session_sync_emits_ack_even_when_no_sessions_exist(tmp_path) -> 
 
     assert any(
         event["type"] == "coding_sessions.synced"
-        and event["payload"] == {"session_count": 0, "live_count": 0, "complete": True}
+        and event["payload"]["session_count"] == 0
+        and event["payload"]["live_count"] == 0
+        and event["payload"]["sessions"] == []
+        and event["payload"]["complete"] is True
         for event in events
     )
+
+
+def test_coding_session_sync_emits_compact_snapshot_with_large_prior_output(tmp_path) -> None:
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    session = ManagedCodingSession(
+        session_id="term_big",
+        intent="open_codex",
+        title="Codex CLI",
+        repo_path=str(tmp_path),
+        command="codex",
+        status=SessionStatus.RUNNING,
+        started_at=datetime.now(),
+        pid=1234,
+        log_path=str(tmp_path / "codex.log"),
+        output_tail=[f"line {index} " + ("x" * 5000) for index in range(24)],
+        screen_text="screen " + ("y" * 50000),
+        screen_rows=48,
+        screen_columns=160,
+    )
+    with app.coding_sessions._lock:
+        app.coding_sessions._sessions[session.session_id] = session
+        app.coding_sessions._start_order.append(session.session_id)
+    app._update_worker_state(
+        session,
+        status_text="Working",
+        worker_phase="working",
+        manager_summary="Codex 1 is making progress on the backend event stream.",
+        last_update="Reading event server code.",
+    )
+
+    app.handle_client_message({"type": "coding_sessions.sync", "payload": {}})
+
+    events = app.events.recent_serialized()
+    synced = next(event for event in events if event["type"] == "coding_sessions.synced")
+    payload = synced["payload"]
+    snapshot = payload["sessions"][0]
+
+    assert payload["session_count"] == 1
+    assert payload["live_count"] == 1
+    assert payload["complete"] is True
+    assert snapshot["session_id"] == "term_big"
+    assert snapshot["tool_label"] == "Codex"
+    assert snapshot["repo_path"] == str(tmp_path)
+    assert snapshot["status"] == "running"
+    assert snapshot["phase"] == "working"
+    assert snapshot["worker_label"] == "Codex 1"
+    assert snapshot["manager_summary"] == "Codex 1 is making progress on the backend event stream."
+    assert snapshot["output_line_count"] == 24
+    assert 0 < len(snapshot["output_summary"]) < 1000
+    assert snapshot["started_at"]
+    assert snapshot["snapshot_at"]
+    assert "screen_text" not in snapshot
+    assert "output_tail" not in snapshot
+    assert "audio_base64" not in snapshot
+    assert not any(event["type"] in {"terminal.output", "terminal.screen"} for event in events)
 
 
 def test_project_picker_message_emits_selected_project_and_status(tmp_path, monkeypatch) -> None:

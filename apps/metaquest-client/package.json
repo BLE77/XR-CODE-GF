@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:https": "XR_METAQUEST_HTTPS_CERT=.certs/quest-cert.pem XR_METAQUEST_HTTPS_KEY=.certs/quest-key.pem vite --host 0.0.0.0",
     "build": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit && vite build",
+    "check:yuki": "node scripts/check-yuki-behavior.mjs",
     "preview": "vite preview",
     "smoke:preview": "node scripts/smoke-preview.mjs"
   },

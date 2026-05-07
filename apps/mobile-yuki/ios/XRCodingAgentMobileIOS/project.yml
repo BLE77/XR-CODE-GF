@@ -1,0 +1,37 @@
+name: MobileYukiIOS
+options:
+  deploymentTarget:
+    iOS: "17.0"
+configs:
+  Debug: debug
+  Release: release
+settings:
+  base:
+    PRODUCT_NAME: MobileYukiIOS
+    PRODUCT_BUNDLE_IDENTIFIER: com.nousresearch.mobileyuki.ios
+    SWIFT_VERSION: 5.0
+    CODE_SIGN_STYLE: Automatic
+    GENERATE_INFOPLIST_FILE: NO
+    INFOPLIST_FILE: ../App/Info.plist
+    LD_RUNPATH_SEARCH_PATHS:
+      - "$(inherited)"
+      - "@executable_path/Frameworks"
+targets:
+  MobileYukiIOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: ../App
+    settings:
+      base:
+        PRODUCT_MODULE_NAME: MobileYukiIOS
+schemes:
+  MobileYukiIOS:
+    build:
+      targets:
+        MobileYukiIOS: all
+    run:
+      config: Debug
+    archive:
+      config: Release

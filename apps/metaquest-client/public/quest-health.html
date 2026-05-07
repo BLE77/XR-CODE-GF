@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quest Health Check</title>
+    <style>
+      body {
+        margin: 0;
+        background: #10141f;
+        color: #eef3ff;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        padding: 24px;
+      }
+
+      h1 {
+        font-size: 28px;
+        margin: 0 0 18px;
+      }
+
+      .row {
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 8px;
+        margin: 10px 0;
+        padding: 14px;
+      }
+
+      .ok {
+        color: #57f0b7;
+      }
+
+      .warn {
+        color: #ffd166;
+      }
+
+      .bad {
+        color: #ff7a90;
+      }
+
+      code {
+        overflow-wrap: anywhere;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Quest Health Check</h1>
+    <div id="results"></div>
+    <script>
+      const results = document.getElementById("results");
+
+      function add(label, value, status) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML = `<strong>${label}</strong><br><code class="${status}">${value}</code>`;
+        results.appendChild(row);
+      }
+
+      add("Loaded URL", window.location.href, "ok");
+      add("Secure context", String(window.isSecureContext), window.isSecureContext ? "ok" : "warn");
+      add("User agent", navigator.userAgent, "ok");
+      add("navigator.xr exists", String(Boolean(navigator.xr)), navigator.xr ? "ok" : "bad");
+
+      async function checkXr() {
+        if (!navigator.xr) {
+          add("immersive-vr support", "navigator.xr is missing", "bad");
+          return;
+        }
+        try {
+          const supported = await navigator.xr.isSessionSupported("immersive-vr");
+          add("immersive-vr support", String(supported), supported ? "ok" : "bad");
+        } catch (error) {
+          add("immersive-vr support", error instanceof Error ? error.message : String(error), "bad");
+        }
+      }
+
+      function checkBridge() {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const url = `${protocol}//${window.location.host}/xr-agent-events`;
+        const ws = new WebSocket(url);
+        const timeout = window.setTimeout(() => {
+          add("same-origin bridge", `timeout: ${url}`, "bad");
+          ws.close();
+        }, 4000);
+        ws.addEventListener("open", () => {
+          window.clearTimeout(timeout);
+          add("same-origin bridge", `open: ${url}`, "ok");
+          ws.close();
+        });
+        ws.addEventListener("error", () => {
+          window.clearTimeout(timeout);
+          add("same-origin bridge", `error: ${url}`, "bad");
+        });
+      }
+
+      checkXr();
+      checkBridge();
+    </script>
+  </body>
+</html>

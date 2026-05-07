@@ -4,6 +4,7 @@ import {
   type CodingSessionSnapshot,
   type CodingSessionStatus,
   type ConnectionSettings,
+  type WireValue,
   eventId,
   isHighSignalEvent,
   payloadBool,
@@ -43,7 +44,7 @@ interface ConnectionState {
   lastEventTs?: string;
 }
 
-type CodingWorkerTool = "claude" | "codex" | "hermes";
+type CodingWorkerTool = "claude" | "codex" | "hermes" | "kimi";
 
 type OpenCodingSessionOptions = {
   dangerouslySkipPermissions?: boolean;
@@ -57,6 +58,8 @@ function intentForWorkerTool(tool: CodingWorkerTool): string {
       return "open_codex";
     case "hermes":
       return "open_hermes_cli";
+    case "kimi":
+      return "open_kimi_code";
   }
 }
 
@@ -87,6 +90,31 @@ function nextStatusForEvent(eventType: string, current: CodingSessionStatus): Co
       return "failed";
     default:
       return current;
+  }
+}
+
+function payloadObjectArray(payload: Record<string, WireValue>, key: string): Record<string, WireValue>[] {
+  const value = payload[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is Record<string, WireValue> =>
+      item !== null && typeof item === "object" && !Array.isArray(item),
+  );
+}
+
+function snapshotStatus(payload: Record<string, WireValue>): CodingSessionStatus {
+  const status = payloadText(payload, "status");
+  switch (status) {
+    case "starting":
+    case "running":
+    case "closing":
+    case "finished":
+    case "failed":
+      return status;
+    default:
+      return "running";
   }
 }
 
@@ -130,6 +158,54 @@ function baseSessionState(sessionId: string): CodingSessionState {
   };
 }
 
+function sessionStateFromSnapshot(
+  payload: Record<string, WireValue>,
+  eventTs: string,
+  current?: CodingSessionState,
+): CodingSessionState | undefined {
+  const sessionId = payloadText(payload, "session_id") ?? payloadText(payload, "sessionId");
+  if (!sessionId) {
+    return undefined;
+  }
+  const outputSummary = payloadText(payload, "output_summary");
+  return {
+    ...(current ?? baseSessionState(sessionId)),
+    sessionId,
+    intent: payloadText(payload, "intent") ?? current?.intent,
+    title: payloadText(payload, "title") ?? current?.title ?? "Worker session",
+    toolLabel: payloadText(payload, "tool_label") ?? current?.toolLabel,
+    repoPath: payloadText(payload, "repo_path") ?? current?.repoPath,
+    command: payloadText(payload, "command") ?? current?.command,
+    status: snapshotStatus(payload),
+    phase: payloadText(payload, "phase") ?? current?.phase,
+    pid: payloadInt(payload, "pid") ?? current?.pid,
+    exitCode: payloadInt(payload, "exit_code") ?? current?.exitCode,
+    summary: payloadText(payload, "summary") ?? current?.summary,
+    logPath: payloadText(payload, "log_path") ?? current?.logPath,
+    workerLabel: payloadText(payload, "worker_label") ?? current?.workerLabel,
+    taskTitle: payloadText(payload, "task_title") ?? current?.taskTitle,
+    workerPhase: payloadText(payload, "worker_phase") ?? current?.workerPhase,
+    statusText: payloadText(payload, "status_text") ?? current?.statusText,
+    managerSummary: payloadText(payload, "manager_summary") ?? current?.managerSummary,
+    waitingOnUser: payloadBool(payload, "waiting_on_user") ?? current?.waitingOnUser ?? false,
+    needsReview: payloadBool(payload, "needs_review") ?? current?.needsReview ?? false,
+    blockedReason: payloadText(payload, "blocked_reason") ?? current?.blockedReason,
+    pendingQuestion: payloadText(payload, "pending_question") ?? current?.pendingQuestion,
+    lastUpdate: payloadText(payload, "last_update") ?? current?.lastUpdate,
+    outputSummary: outputSummary ?? current?.outputSummary,
+    outputLineCount: payloadInt(payload, "output_line_count") ?? current?.outputLineCount,
+    outputTail: current?.outputTail.length ? current.outputTail : outputSummary ? [outputSummary] : [],
+    hasScreen: payloadBool(payload, "has_screen") ?? current?.hasScreen,
+    screenText: current?.screenText,
+    screenRows: payloadInt(payload, "screen_rows") ?? current?.screenRows,
+    screenColumns: payloadInt(payload, "screen_columns") ?? current?.screenColumns,
+    startedAt: payloadText(payload, "started_at") ?? current?.startedAt,
+    finishedAt: payloadText(payload, "finished_at") ?? current?.finishedAt,
+    snapshotAt: payloadText(payload, "snapshot_at") ?? current?.snapshotAt,
+    lastEventTs: eventTs,
+  };
+}
+
 function sortSessions(sessions: CodingSessionState[]): CodingSessionSnapshot[] {
   const rank = (session: CodingSessionState): number => {
     if (session.waitingOnUser) {
@@ -140,6 +216,7 @@ function sortSessions(sessions: CodingSessionState[]): CodingSessionSnapshot[] {
     }
     switch (session.status) {
       case "running":
+      case "starting":
         return 2;
       case "closing":
         return 3;
@@ -182,7 +259,7 @@ function sessionAttentionRank(session: CodingSessionSnapshot): number {
   if (session.workerPhase === "blocked" || session.status === "failed" || session.blockedReason) {
     return 2;
   }
-  if (session.status === "running") {
+  if (session.status === "running" || session.status === "starting") {
     return 3;
   }
   return 4;
@@ -423,6 +500,24 @@ export function useQuestClient() {
     if (event.type === "coding_sessions.synced") {
       const sessionCount = payloadInt(event.payload, "session_count") ?? 0;
       const liveCount = payloadInt(event.payload, "live_count") ?? 0;
+      const snapshotPayloads = payloadObjectArray(event.payload, "sessions");
+      if (snapshotPayloads.length > 0 || sessionCount === 0) {
+        const nextSessions = new Map<string, CodingSessionState>();
+        for (const snapshotPayload of snapshotPayloads) {
+          const snapshot = sessionStateFromSnapshot(
+            snapshotPayload,
+            event.ts,
+            payloadText(snapshotPayload, "session_id")
+              ? sessionMapRef.current.get(payloadText(snapshotPayload, "session_id") as string)
+              : undefined,
+          );
+          if (snapshot) {
+            nextSessions.set(snapshot.sessionId, snapshot);
+          }
+        }
+        sessionMapRef.current = nextSessions;
+        refreshSessions();
+      }
       setStatusText(
         sessionCount === 0
           ? "Worker board synced. No active workers yet."
@@ -453,6 +548,16 @@ export function useQuestClient() {
       }
     } else if (event.type === "avatar.speaking" || event.type === "assistant.reply") {
       const spokenText = payloadText(event.payload, "text");
+      const backendAudioPending = payloadBool(event.payload, "backend_audio_pending") === true;
+      if (backendAudioPending && !payloadText(event.payload, "audio_base64")) {
+        setAvatarState((current) => ({
+          mode: "thinking",
+          transcript: current.transcript,
+          spokenText: spokenText ?? current.spokenText,
+        }));
+        scheduleAvatarReset(1800);
+        return;
+      }
       const explicitDurationMs = payloadInt(event.payload, "duration_ms");
       setAvatarState((current) => ({
         mode: "speaking",
@@ -591,15 +696,15 @@ export function useQuestClient() {
       refreshSessions();
     }
 
-    if (event.type !== "terminal.screen") {
-      setEvents((current) => [event, ...current].slice(0, 160));
-    }
+    setEvents((current) => [event, ...current].slice(0, 160));
   }
 
-  function sendMessage(payload: Record<string, unknown>): boolean {
+  function sendMessage(payload: Record<string, unknown>, options: { silentDisconnected?: boolean } = {}): boolean {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
-      setStatusText("Connect to the Mac companion first.");
+      if (!options.silentDisconnected) {
+        setStatusText("Connect to the Mac companion first.");
+      }
       return false;
     }
     socket.send(JSON.stringify(payload));
@@ -800,6 +905,19 @@ export function useQuestClient() {
     return sent;
   }
 
+  function sendLiveContext(source: string, context: Record<string, unknown>) {
+    return sendMessage(
+      {
+        type: "live_context.update",
+        payload: {
+          source,
+          context,
+        },
+      },
+      { silentDisconnected: true },
+    );
+  }
+
   function sendVoiceAudio(audioBase64: string, mimeType: string, repoPath?: string) {
     const sent = sendMessage({
       type: "voice.audio",
@@ -815,6 +933,35 @@ export function useQuestClient() {
     return sent;
   }
 
+  function requestRealtimeVoiceSession(requestId: string, repoPath?: string) {
+    const sent = sendMessage({
+      type: "voice.realtime.session.request",
+      payload: {
+        request_id: requestId,
+        ...(repoPath ? { repo_path: repoPath } : {}),
+      },
+    });
+    if (sent) {
+      setStatusText("Requesting realtime Hermes voice session...");
+    }
+    return sent;
+  }
+
+  function sendRealtimeVoiceOffer(requestId: string, sdp: string, repoPath?: string) {
+    const sent = sendMessage({
+      type: "voice.realtime.sdp.offer",
+      payload: {
+        request_id: requestId,
+        sdp,
+        ...(repoPath ? { repo_path: repoPath } : {}),
+      },
+    });
+    if (sent) {
+      setStatusText("Sent realtime Hermes voice offer.");
+    }
+    return sent;
+  }
+
   function openCodingSession(tool: CodingWorkerTool, repoPath?: string, options: OpenCodingSessionOptions = {}) {
     const sent = sendMessage({
       type: "coding_session.open",
@@ -825,7 +972,7 @@ export function useQuestClient() {
       },
     });
     if (sent) {
-      const label = tool === "claude" ? "Claude" : tool === "codex" ? "Codex" : "Hermes";
+      const label = tool === "claude" ? "Claude" : tool === "codex" ? "Codex" : tool === "kimi" ? "Kimi" : "Hermes";
       setStatusText(`Opening ${label} worker...`);
     }
     return sent;
@@ -883,7 +1030,7 @@ export function useQuestClient() {
 
   const signalEvents = events.filter(isHighSignalEvent);
   const pendingSession = sessions.find((session) => session.waitingOnUser);
-  const liveSessions = sessions.filter((session) => session.status === "running");
+  const liveSessions = sessions.filter((session) => session.status === "running" || session.status === "starting");
   const attentionSessions = [...sessions]
     .sort((left, right) => sessionAttentionRank(left) - sessionAttentionRank(right))
     .filter((session) =>
@@ -934,6 +1081,9 @@ export function useQuestClient() {
     selectedProjectPath,
     sendDirectWorkerInput,
     sendHermesCommand,
+    sendLiveContext,
+    requestRealtimeVoiceSession,
+    sendRealtimeVoiceOffer,
     sendVoiceAudio,
     sendWorkerReply,
     sessions,

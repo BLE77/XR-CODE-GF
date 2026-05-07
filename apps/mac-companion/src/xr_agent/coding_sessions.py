@@ -82,6 +82,11 @@ DEFAULT_CODING_SESSION_TOOLS: dict[str, CodingSessionTool] = {
         title="Hermes CLI",
         argv=("hermes",),
     ),
+    "open_kimi_code": CodingSessionTool(
+        intent="open_kimi_code",
+        title="Kimi Code",
+        argv=("kimi",),
+    ),
 }
 
 
@@ -550,6 +555,7 @@ class ManagedCodingSessionManager:
         prompt_key: str | None = None
         trust_prompt_visible = _claude_trust_prompt_visible(prompt_text)
         bypass_prompt_visible = _claude_bypass_prompt_visible(compact_prompt_text)
+        mcp_server_prompt_visible = _claude_mcp_server_prompt_visible(prompt_text, compact_prompt_text)
 
         if bypass_prompt_visible and f"{session.session_id}:bypass-permissions" not in self._auto_confirmed_prompts:
             # Current Claude CLI warning defaults to "No, exit", so we move to
@@ -558,6 +564,11 @@ class ManagedCodingSessionManager:
             confirmation_bytes = b"\x1b[B\r"
             log_line = "[auto-accepted claude bypass-permissions prompt]"
             notice_text = "Hermes approved Claude's bypass-permissions prompt and Claude is continuing."
+        elif mcp_server_prompt_visible and f"{session.session_id}:mcp-server" not in self._auto_confirmed_prompts:
+            prompt_key = "mcp-server"
+            confirmation_bytes = b"\r"
+            log_line = "[auto-accepted claude mcp server prompt]"
+            notice_text = "Hermes approved Claude's MCP server prompt and Claude is continuing."
         elif trust_prompt_visible and f"{session.session_id}:trust" not in self._auto_confirmed_prompts:
             prompt_key = "trust"
             confirmation_bytes = b"\r"
@@ -586,7 +597,11 @@ class ManagedCodingSessionManager:
             _claude_bypass_prompt_visible(compact_prompt_text)
             and f"{session.session_id}:bypass-permissions" not in self._auto_confirmed_prompts
         )
-        return trust_pending or bypass_pending
+        mcp_server_pending = (
+            _claude_mcp_server_prompt_visible(prompt_text, compact_prompt_text)
+            and f"{session.session_id}:mcp-server" not in self._auto_confirmed_prompts
+        )
+        return trust_pending or bypass_pending or mcp_server_pending
 
     def _require_session(self, session_id: str) -> ManagedCodingSession:
         session = self.get(session_id)
@@ -673,6 +688,17 @@ def _claude_bypass_prompt_visible(compact_prompt_text: str) -> bool:
         "bypasspermissionsmode" in compact_prompt_text
         and "yesiaccept" in compact_prompt_text
         and "entertoconfirm" in compact_prompt_text
+    )
+
+
+def _claude_mcp_server_prompt_visible(prompt_text: str, compact_prompt_text: str) -> bool:
+    return (
+        ("new mcp server found" in prompt_text or "mcp servers may execute code" in prompt_text)
+        and (
+            "use this and all future mcp servers in this project" in prompt_text
+            or "usethisandallfuturemcpserversinthisproject" in compact_prompt_text
+        )
+        and ("enter to confirm" in prompt_text or "entertoconfirm" in compact_prompt_text)
     )
 
 

@@ -13,15 +13,17 @@ export interface AgentWireEvent {
   payload: Record<string, WireValue>;
 }
 
-export type CodingSessionStatus = "running" | "closing" | "finished" | "failed";
+export type CodingSessionStatus = "starting" | "running" | "closing" | "finished" | "failed";
 
 export interface CodingSessionSnapshot {
   sessionId: string;
   intent?: string;
   title: string;
+  toolLabel?: string | null;
   repoPath?: string;
   command?: string;
   status: CodingSessionStatus;
+  phase?: string | null;
   pid?: number;
   exitCode?: number | null;
   summary?: string | null;
@@ -36,10 +38,16 @@ export interface CodingSessionSnapshot {
   blockedReason?: string | null;
   pendingQuestion?: string | null;
   lastUpdate?: string | null;
+  outputSummary?: string | null;
+  outputLineCount?: number | null;
   outputTail: string[];
+  hasScreen?: boolean;
   screenText?: string | null;
   screenRows?: number | null;
   screenColumns?: number | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  snapshotAt?: string | null;
 }
 
 export interface ConnectionSettings {

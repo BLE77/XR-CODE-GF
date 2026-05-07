@@ -5,6 +5,7 @@ import json
 import threading
 from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable
 
@@ -19,7 +20,34 @@ except ImportError:  # pragma: no cover - optional dependency at runtime
 
 
 class EventServer:
-    _REPLAY_EXCLUDED_TYPES = {"session.output", "terminal.output", "terminal.screen"}
+    _MAX_LIVE_EVENT_BYTES = 256 * 1024
+    _MAX_REPLAY_EVENT_BYTES = 16 * 1024
+    _MAX_LIVE_STRING_CHARS = 24 * 1024
+    _MAX_HISTORY_STRING_CHARS = 4 * 1024
+    _MAX_LIVE_AUDIO_BASE64_CHARS = 128 * 1024
+    _MAX_LIST_ITEMS = 80
+    _STRING_FIELD_LIMITS = {
+        "line": 2048,
+        "screen_text": 12000,
+        "text": 4096,
+        "summary": 4096,
+        "manager_summary": 1200,
+        "status_text": 600,
+        "pending_question": 1200,
+        "question": 1200,
+        "last_update": 1200,
+        "output_summary": 1200,
+        "sdp": 12000,
+        "client_secret": 4096,
+    }
+    _REPLAY_EXCLUDED_TYPES = {
+        "avatar.speaking",
+        "session.output",
+        "terminal.output",
+        "terminal.screen",
+        "voice.realtime.session",
+        "voice.realtime.sdp.answer",
+    }
 
     def __init__(self, max_events: int = 100) -> None:
         self._events: deque[AgentEvent] = deque(maxlen=max_events)
@@ -109,9 +137,11 @@ class EventServer:
             self._thread = None
 
     def publish(self, event: AgentEvent) -> None:
+        history_event = self._history_event(event)
+        live_event = self._live_event(event)
         with self._events_lock:
-            self._events.append(event)
-        wire_message = json.dumps(self.serialize_event(event))
+            self._events.append(history_event)
+        wire_message = self._wire_message(live_event, max_bytes=self._MAX_LIVE_EVENT_BYTES)
         with self._subscribers_lock:
             subscribers = list(self._subscribers)
         for queue in subscribers:
@@ -137,6 +167,107 @@ class EventServer:
             "payload": event.payload,
         }
 
+    def _live_event(self, event: AgentEvent) -> AgentEvent:
+        payload = self._sanitize_payload(event.payload, keep_audio=True)
+        return replace(event, payload=payload)
+
+    def _history_event(self, event: AgentEvent) -> AgentEvent:
+        payload = self._sanitize_payload(event.payload, keep_audio=False)
+        return replace(event, payload=payload)
+
+    def _sanitize_payload(self, payload: dict[str, Any], *, keep_audio: bool) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "audio_base64":
+                if keep_audio and isinstance(value, str) and len(value) <= self._MAX_LIVE_AUDIO_BASE64_CHARS:
+                    sanitized[key] = value
+                else:
+                    sanitized["audio_base64_stripped"] = True
+                    sanitized["audio_base64_marker"] = self._stripped_marker(
+                        "audio_base64",
+                        len(value) if isinstance(value, str) else 0,
+                    )
+                continue
+            sanitized[key] = self._sanitize_value(value, field_name=key, keep_audio=keep_audio)
+        return sanitized
+
+    def _sanitize_value(self, value: Any, *, field_name: str, keep_audio: bool) -> Any:
+        if isinstance(value, str):
+            limit = self._STRING_FIELD_LIMITS.get(
+                field_name,
+                self._MAX_LIVE_STRING_CHARS if keep_audio else self._MAX_HISTORY_STRING_CHARS,
+            )
+            return self._truncate_string(value, limit, field_name)
+        if isinstance(value, dict):
+            sanitized: dict[str, Any] = {}
+            for key, item in list(value.items())[: self._MAX_LIST_ITEMS]:
+                field_key = str(key)
+                if field_key == "audio_base64":
+                    if keep_audio and isinstance(item, str) and len(item) <= self._MAX_LIVE_AUDIO_BASE64_CHARS:
+                        sanitized[field_key] = item
+                    else:
+                        sanitized["audio_base64_stripped"] = True
+                        sanitized["audio_base64_marker"] = self._stripped_marker(
+                            "audio_base64",
+                            len(item) if isinstance(item, str) else 0,
+                        )
+                    continue
+                sanitized[field_key] = self._sanitize_value(item, field_name=field_key, keep_audio=keep_audio)
+            return sanitized
+        if isinstance(value, list):
+            items = value[: self._MAX_LIST_ITEMS]
+            sanitized_items = [
+                self._sanitize_value(item, field_name=field_name, keep_audio=keep_audio)
+                for item in items
+            ]
+            if len(value) > self._MAX_LIST_ITEMS:
+                sanitized_items.append(
+                    self._stripped_marker(field_name, len(value), unit="items")
+                )
+            return sanitized_items
+        return value
+
+    def _truncate_string(self, value: str, limit: int, field_name: str) -> str:
+        if len(value) <= limit:
+            return value
+        marker = self._stripped_marker(field_name, len(value))
+        keep = max(0, limit - len(marker) - 1)
+        return f"{value[:keep].rstrip()} {marker}".strip()
+
+    def _stripped_marker(self, field_name: str, original_size: int, *, unit: str = "chars") -> str:
+        return f"[stripped oversized {field_name}: original_{unit}={original_size}]"
+
+    def _wire_message(self, event: AgentEvent, *, max_bytes: int) -> str:
+        payload = self.serialize_event(event)
+        wire_message = json.dumps(payload, separators=(",", ":"))
+        if len(wire_message.encode("utf-8")) <= max_bytes:
+            return wire_message
+        compact_payload = {
+            "payload_stripped": True,
+            "payload_marker": f"[stripped oversized event payload: original_bytes={len(wire_message.encode('utf-8'))}]",
+        }
+        compact_event = replace(event, payload=compact_payload)
+        return json.dumps(self.serialize_event(compact_event), separators=(",", ":"))
+
+    def _should_replay(self, event: AgentEvent) -> bool:
+        if event.event_type in self._REPLAY_EXCLUDED_TYPES:
+            return False
+        if self._contains_audio_payload(event.payload):
+            return False
+        wire_message = self._wire_message(event, max_bytes=self._MAX_REPLAY_EVENT_BYTES)
+        if len(wire_message.encode("utf-8")) > self._MAX_REPLAY_EVENT_BYTES:
+            return False
+        return True
+
+    def _contains_audio_payload(self, value: Any) -> bool:
+        if isinstance(value, dict):
+            if "audio_base64" in value or value.get("audio_base64_stripped") is True:
+                return True
+            return any(self._contains_audio_payload(item) for item in value.values())
+        if isinstance(value, list):
+            return any(self._contains_audio_payload(item) for item in value)
+        return False
+
     def _publish_to_queue(self, queue: asyncio.Queue[str | None], wire_message: str) -> None:
         loop = self._loop
         if loop is not None and loop.is_running():
@@ -158,13 +289,13 @@ class EventServer:
         with self._events_lock:
             replay_events = [
                 event for event in self._events
-                if event.event_type not in self._REPLAY_EXCLUDED_TYPES
+                if self._should_replay(event)
             ]
         sender_task: asyncio.Task[None] | None = None
         try:
             sender_task = asyncio.create_task(self._send_queue_messages(websocket, queue))
             for event in replay_events:
-                self._enqueue_message(queue, json.dumps(self.serialize_event(event)))
+                self._enqueue_message(queue, self._wire_message(event, max_bytes=self._MAX_REPLAY_EVENT_BYTES))
             async for raw_message in websocket:
                 # Keep the websocket loop responsive even when the app handler does
                 # heavier work like launching or routing coding sessions.

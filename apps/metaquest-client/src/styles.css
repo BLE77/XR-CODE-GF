@@ -1280,7 +1280,7 @@ textarea {
 .deck-center {
   grid-area: center;
   display: grid;
-  grid-template-rows: minmax(30.5rem, 1fr) auto;
+  grid-template-rows: minmax(30.5rem, 1fr) auto auto;
   gap: 0.6rem;
   min-width: 0;
 }
@@ -1925,13 +1925,19 @@ body:has(.control-deck) {
 .deck-xr-pill span {
   font-size: 1.25rem;
   font-weight: 900;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
 }
 
 .deck-xr-pill small {
   font-family: "SF Mono", "Menlo", monospace;
   font-size: 0.66rem;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
+  line-height: 1.1;
+  max-width: min(12rem, 78vw);
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .deck-code {
@@ -1980,7 +1986,7 @@ body:has(.control-deck) {
 }
 
 .deck-center {
-  grid-template-rows: minmax(28.5rem, 1fr) auto;
+  grid-template-rows: minmax(28.5rem, 1fr) auto auto;
   gap: 0.85rem;
 }
 
@@ -2526,5 +2532,73 @@ body:has(.control-deck) {
 
   .control-deck .immersive-stage-control-hint {
     display: none;
+  }
+}
+
+.voice-monitor {
+  display: grid;
+  gap: 0.42rem;
+  min-width: 0;
+}
+
+.voice-telemetry {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+  padding: 0 0.25rem;
+}
+
+.voice-telemetry strong {
+  color: var(--os-ink, #f3fff9);
+  font-size: 0.82rem;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-telemetry span {
+  color: var(--os-muted, rgba(232, 246, 241, 0.66));
+  font-size: 0.72rem;
+  line-height: 1.22;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.next-action-strip {
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.58fr) minmax(0, 1fr) auto;
+  gap: 0.9rem;
+  align-items: center;
+  min-height: 5.1rem;
+  padding: 0.85rem 1rem;
+}
+
+.next-action-strip strong {
+  display: block;
+  color: var(--os-ink, #f3fff9);
+  font-size: 1rem;
+  line-height: 1.18;
+}
+
+.next-action-strip p {
+  margin: 0;
+  color: var(--os-muted, rgba(232, 246, 241, 0.72));
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.next-action-strip.tone-attention {
+  border-color: rgba(229, 123, 21, 0.3);
+}
+
+.next-action-strip.tone-working {
+  border-color: rgba(20, 98, 243, 0.25);
+}
+
+@media (max-width: 1320px) {
+  .next-action-strip {
+    grid-template-columns: 1fr;
   }
 }

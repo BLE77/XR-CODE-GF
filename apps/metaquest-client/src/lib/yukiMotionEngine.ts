@@ -37,6 +37,7 @@ type MotionProfile = {
   clipCrossFadeSeconds: number;
   floorClearance: number;
   floorResponse: number;
+  plantBias: number;
 };
 
 const MOTION_STATES: YukiMotionState[] = [
@@ -62,6 +63,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.38,
     floorClearance: 0.018,
     floorResponse: 11,
+    plantBias: 0.86,
   },
   listening: {
     energy: 0.42,
@@ -75,6 +77,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.24,
     floorClearance: 0.026,
     floorResponse: 14,
+    plantBias: 0.76,
   },
   thinking: {
     energy: 0.34,
@@ -88,6 +91,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.34,
     floorClearance: 0.026,
     floorResponse: 13,
+    plantBias: 0.82,
   },
   speaking: {
     energy: 0.72,
@@ -101,6 +105,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.22,
     floorClearance: 0.03,
     floorResponse: 15,
+    plantBias: 0.7,
   },
   alert: {
     energy: 0.86,
@@ -114,6 +119,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.16,
     floorClearance: 0.034,
     floorResponse: 17,
+    plantBias: 0.74,
   },
   ready: {
     energy: 0.24,
@@ -127,6 +133,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.42,
     floorClearance: 0.022,
     floorResponse: 12,
+    plantBias: 0.9,
   },
   sitting: {
     energy: 0.16,
@@ -140,6 +147,7 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     clipCrossFadeSeconds: 0.44,
     floorClearance: 0.018,
     floorResponse: 14,
+    plantBias: 1,
   },
 };
 
@@ -168,6 +176,7 @@ function profileBlend(weights: Record<YukiMotionState, number>): MotionProfile {
     clipCrossFadeSeconds: 0,
     floorClearance: 0,
     floorResponse: 0,
+    plantBias: 0,
   };
 
   MOTION_STATES.forEach((state) => {
@@ -184,6 +193,7 @@ function profileBlend(weights: Record<YukiMotionState, number>): MotionProfile {
     blended.clipCrossFadeSeconds += profile.clipCrossFadeSeconds * weight;
     blended.floorClearance += profile.floorClearance * weight;
     blended.floorResponse += profile.floorResponse * weight;
+    blended.plantBias += profile.plantBias * weight;
   });
 
   return blended;
@@ -192,6 +202,10 @@ function profileBlend(weights: Record<YukiMotionState, number>): MotionProfile {
 function triangularContact(phase: number, center: number) {
   const wrapped = Math.abs(((phase - center + 1.5) % 1) - 0.5);
   return THREE.MathUtils.smoothstep(1 - wrapped * 2, 0.22, 0.72);
+}
+
+function actualXrSession(intent: YukiMotionIntent) {
+  return intent.activeXrSession && !intent.emulatorXrSession;
 }
 
 export class YukiMotionEngine {
@@ -264,8 +278,13 @@ export class YukiMotionEngine {
     });
 
     const profile = profileBlend(this.weights);
+    const isActualXr = actualXrSession(intent);
+    const sittingWeight = this.weights.sitting;
     const speechBoost = intent.speechSpeaking ? 0.12 : 0;
-    const xrDamp = intent.activeXrSession && !intent.emulatorXrSession ? 0.72 : 1;
+    const xrDamp = isActualXr ? 0.68 : 1;
+    const plantedVerticalDamp = isActualXr ? THREE.MathUtils.lerp(0.12, 0.015, sittingWeight) : 1;
+    const plantedHorizontalDamp = isActualXr ? THREE.MathUtils.lerp(0.46, 0.14, sittingWeight) : 1;
+    const plantedRootTiltDamp = isActualXr ? THREE.MathUtils.lerp(0.58, 0.2, sittingWeight) : 1;
     const previewBoost = intent.desktopPreviewActive ? 1.1 : 1;
     const energy = THREE.MathUtils.clamp((profile.energy + speechBoost) * xrDamp * previewBoost, 0, 1);
     const pulse = intent.elapsed * profile.pulseSpeed;
@@ -273,31 +292,54 @@ export class YukiMotionEngine {
     const liftPhase = Math.max(0, Math.sin(pulse));
 
     this.transitionPulse = approach(this.transitionPulse, 0, 5.5, delta);
-    this.stridePhase = (this.stridePhase + delta * profile.strideSpeed * (0.45 + energy)) % 1;
+    const strideDamp = isActualXr
+      ? THREE.MathUtils.lerp(0.28, 0.02, THREE.MathUtils.clamp(profile.plantBias, 0, 1))
+      : 1;
+    this.stridePhase =
+      (this.stridePhase + delta * profile.strideSpeed * (0.45 + energy) * (1 - sittingWeight) * strideDamp) % 1;
 
     this.rootOffsetTarget.set(
-      sidePhase * profile.sideSway * energy,
-      profile.verticalLift * (0.35 + liftPhase * 0.65) + this.transitionPulse * 0.01,
-      -profile.attentiveness * 0.012 * energy,
+      sidePhase * profile.sideSway * energy * plantedHorizontalDamp,
+      (profile.verticalLift * (0.35 + liftPhase * 0.65) + (isActualXr ? 0 : this.transitionPulse * 0.01)) *
+        plantedVerticalDamp,
+      -profile.attentiveness * 0.012 * energy * plantedHorizontalDamp,
     );
     approachVector(this.rootOffset, this.rootOffsetTarget, 8.5, delta);
 
     const shoulderCounter = Math.sin(pulse * 0.62) * energy;
-    this.rootRotation.x = approach(this.rootRotation.x, profile.forwardLean * (0.8 + energy * 0.2), 8, delta);
+    this.rootRotation.x = approach(
+      this.rootRotation.x,
+      profile.forwardLean * (0.8 + energy * 0.2) * plantedRootTiltDamp,
+      8,
+      delta,
+    );
     this.rootRotation.y = approach(this.rootRotation.y, shoulderCounter * 0.018 + this.transitionPulse * 0.018, 7, delta);
-    this.rootRotation.z = approach(this.rootRotation.z, -sidePhase * 0.026 * energy, 7, delta);
+    this.rootRotation.z = approach(this.rootRotation.z, -sidePhase * 0.026 * energy * plantedRootTiltDamp, 7, delta);
 
-    this.clipTimeScale = approach(this.clipTimeScale, profile.clipTimeScale + speechBoost * 0.18, 8, delta);
+    const targetClipTimeScale = (profile.clipTimeScale + speechBoost * 0.18) * (isActualXr ? 0.94 - sittingWeight * 0.12 : 1);
+    const targetFloorClearance = isActualXr
+      ? THREE.MathUtils.lerp(0.008, 0.0045, sittingWeight) + Math.max(0, 1 - profile.plantBias) * 0.003
+      : profile.floorClearance;
+    const targetFloorResponse = isActualXr
+      ? THREE.MathUtils.lerp(22, 26, sittingWeight) + Math.max(0, 1 - profile.plantBias) * 2
+      : profile.floorResponse;
+
+    this.clipTimeScale = approach(this.clipTimeScale, targetClipTimeScale, 8, delta);
     this.clipCrossFadeSeconds = approach(this.clipCrossFadeSeconds, profile.clipCrossFadeSeconds, 7, delta);
-    this.floorClearance = approach(this.floorClearance, profile.floorClearance, 9, delta);
-    this.floorResponse = approach(this.floorResponse, profile.floorResponse, 9, delta);
+    this.floorClearance = approach(this.floorClearance, targetFloorClearance, 11, delta);
+    this.floorResponse = approach(this.floorResponse, targetFloorResponse, 11, delta);
 
-    this.frame.clipTimeScale = THREE.MathUtils.clamp(this.clipTimeScale, 0.72, 1.24);
+    this.frame.clipTimeScale = THREE.MathUtils.clamp(this.clipTimeScale, isActualXr ? 0.58 : 0.72, 1.24);
     this.frame.clipCrossFadeSeconds = THREE.MathUtils.clamp(this.clipCrossFadeSeconds, 0.12, 0.48);
-    this.frame.floorClearance = THREE.MathUtils.clamp(this.floorClearance, 0.014, 0.04);
-    this.frame.floorResponse = THREE.MathUtils.clamp(this.floorResponse, 8, 18);
-    this.frame.leftFootLock = triangularContact(this.stridePhase, 0.08);
-    this.frame.rightFootLock = triangularContact(this.stridePhase, 0.58);
+    this.frame.floorClearance = THREE.MathUtils.clamp(this.floorClearance, isActualXr ? 0.004 : 0.014, 0.04);
+    this.frame.floorResponse = THREE.MathUtils.clamp(this.floorResponse, 8, isActualXr ? 28 : 18);
+    const leftContact = triangularContact(this.stridePhase, 0.08);
+    const rightContact = triangularContact(this.stridePhase, 0.58);
+    const bilateralPlant = isActualXr
+      ? THREE.MathUtils.clamp(0.62 + profile.plantBias * 0.34 + sittingWeight * 0.18 - energy * 0.08, 0.72, 1)
+      : 0;
+    this.frame.leftFootLock = THREE.MathUtils.lerp(leftContact, 1, bilateralPlant);
+    this.frame.rightFootLock = THREE.MathUtils.lerp(rightContact, 1, bilateralPlant);
     this.frame.stridePhase = this.stridePhase;
 
     return this.frame;
