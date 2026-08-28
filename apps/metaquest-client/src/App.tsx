@@ -19,6 +19,7 @@ const ImmersiveHermesStage = lazy(async () => {
 
 const SETTINGS_KEY = "xr-agent-metaquest-settings";
 const SPEECH_KEY = "xr-agent-metaquest-speech-enabled";
+const DEVICE_TOKEN_KEY = "xr-agent-device-token";
 const XR_VOICE_TOGGLE_EVENT = "xr-agent-voice-toggle-request";
 const BRIDGE_ENABLED =
   import.meta.env.DEV || String(import.meta.env.VITE_XR_ENABLE_BRIDGE ?? "").toLowerCase() === "true";
@@ -50,6 +51,7 @@ type RealtimeVoiceConnection = {
   dataChannel: RTCDataChannel;
   mediaStream: MediaStream;
   audioElement: HTMLAudioElement;
+  sessionConfig?: Record<string, unknown>;
 };
 
 type PendingRealtimeVoiceRequest = {
@@ -115,7 +117,7 @@ const REALTIME_HERMES_LOCAL_ONLY_UTTERANCES = new Set([
 ]);
 
 const REALTIME_HERMES_ACTION_PATTERN =
-  /\b(open|launch|start|tell|ask|send|close|run|build|test|fix|inspect|check|status|list|summarize|read|look|watch|see|show|hide|move|grab|drag|place|sit|stand|walk|go|scan|classify|use|make|change|update|debug|review|claude|codex|hermes|kimi|worker|workers|agent|agents|terminal|session|panel|panels|ui|xr|quest|yuki|voice|personality|persona|behavior|default|sassy|spicy|flirty|sassier|flirtier|screen|room|camera|browser|website|code|repo|git)\b|what happened/i;
+  /\b(open|launch|start|tell|ask|send|close|run|build|test|fix|inspect|check|status|list|summarize|read|look|watch|see|show|hide|move|grab|drag|place|sit|stand|walk|go|scan|classify|use|make|change|update|debug|review|remember|remind|save|recall|forget|claude|codex|hermes|kimi|worker|workers|agent|agents|terminal|session|panel|panels|ui|xr|quest|yuki|voice|personality|persona|behavior|default|sassy|spicy|flirty|sassier|flirtier|preference|preferences|profile|memory|memories|reminder|reminders|honcho|screen|room|camera|browser|website|code|repo|git)\b|what happened/i;
 
 function shouldRouteRealtimeTranscriptToHermes(text: string): boolean {
   const normalized = normalizeRealtimeRouteText(text).replace(/[.!?]+$/g, "");
@@ -210,6 +212,14 @@ function loadSpeechEnabled(): boolean {
     return raw !== "false";
   } catch {
     return true;
+  }
+}
+
+function loadDeviceToken(): string {
+  try {
+    return window.localStorage.getItem(DEVICE_TOKEN_KEY) ?? "";
+  } catch {
+    return "";
   }
 }
 
@@ -342,6 +352,7 @@ export default function App() {
   const [scheme, setScheme] = useState<"ws" | "wss">(initialSettings.scheme);
   const [port, setPort] = useState(String(initialSettings.port));
   const [repoPath, setRepoPath] = useState(initialSettings.repoPath);
+  const [deviceToken, setDeviceToken] = useState(loadDeviceToken);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>("");
   const [hermesPrompt, setHermesPrompt] = useState("");
   const [workerReply, setWorkerReply] = useState("");
@@ -374,6 +385,7 @@ export default function App() {
   const handledRealtimeFunctionCallsRef = useRef<Set<string>>(new Set());
   const lastRealtimeHermesRouteRef = useRef<{ normalized: string; at: number } | null>(null);
   const realtimeResponseInProgressRef = useRef(false);
+  const pendingRealtimeFunctionResponseRef = useRef(false);
   const realtimeNarrationEventIdsRef = useRef<Set<string>>(new Set());
   const lastRealtimeNarrationRef = useRef<{ normalized: string; at: number } | null>(null);
   const queuedRealtimeNarrationRef = useRef<{ text: string; instructions: string } | null>(null);
@@ -432,8 +444,18 @@ export default function App() {
   const phoneBodyLaunch = isPhoneBodyLaunch();
   const bodyDeviceLabel = phoneBodyLaunch ? `${mobilePlatformLabel()} XR Body` : "Quest";
   const bridgeScheme = window.location.protocol === "https:" ? "wss" : "ws";
-  const bridgeTargetUrl = `${bridgeScheme}://${window.location.host}/xr-agent-events`;
-  const directTargetUrl = `${scheme}://${host.trim() || "127.0.0.1"}:${Number.parseInt(port, 10) || 8765}`;
+  const pairingCode = launchParams().get("pair") ?? "";
+  const withSocketAuth = (url: string) => {
+    const target = new URL(url);
+    if (deviceToken) {
+      target.searchParams.set("token", deviceToken);
+    } else if (pairingCode) {
+      target.searchParams.set("pair", pairingCode);
+    }
+    return target.toString();
+  };
+  const bridgeTargetUrl = withSocketAuth(`${bridgeScheme}://${window.location.host}/xr-agent-events`);
+  const directTargetUrl = withSocketAuth(`${scheme}://${host.trim() || "127.0.0.1"}:${Number.parseInt(port, 10) || 8765}`);
   const effectiveTargetUrl = connectionMode === "bridge" ? bridgeTargetUrl : directTargetUrl;
   const directModeUsesLoopback = ["localhost", "127.0.0.1"].includes((host.trim() || "").toLowerCase());
   const directModeMixedContentRisk = connectionMode === "direct" && window.location.protocol === "https:" && scheme === "ws";
@@ -664,6 +686,7 @@ export default function App() {
       activeRealtimeVoiceRef.current = null;
       handledRealtimeFunctionCallsRef.current.clear();
       realtimeResponseInProgressRef.current = false;
+      pendingRealtimeFunctionResponseRef.current = false;
       realtimeNarrationEventIdsRef.current.clear();
       lastRealtimeNarrationRef.current = null;
       queuedRealtimeNarrationRef.current = null;
@@ -952,6 +975,20 @@ export default function App() {
   }, [client.isConnected]);
 
   useEffect(() => {
+    const paired = client.events.find((event) => event.type === "auth.paired");
+    const token = paired ? payloadText(paired.payload, "device_token") : undefined;
+    if (!token || token === deviceToken) {
+      return;
+    }
+    try {
+      window.localStorage.setItem(DEVICE_TOKEN_KEY, token);
+    } catch {
+      client.noteStatus("Paired for this session, but the browser could not persist the device token.");
+    }
+    setDeviceToken(token);
+  }, [client.events, deviceToken]);
+
+  useEffect(() => {
     const pending = pendingRealtimeVoiceRef.current;
     if (!client.isConnected || !pending || pending.sent) {
       return;
@@ -1009,6 +1046,10 @@ export default function App() {
       client.noteStatus("Realtime voice answer arrived after the session was closed.");
       return;
     }
+    const sessionConfig = answerEvent.payload.session;
+    if (sessionConfig && typeof sessionConfig === "object" && !Array.isArray(sessionConfig)) {
+      realtime.sessionConfig = sessionConfig as Record<string, unknown>;
+    }
     void realtime.peerConnection
       .setRemoteDescription({ type: "answer", sdp })
       .then(() => {
@@ -1047,7 +1088,7 @@ export default function App() {
     if (connectionMode === "bridge") {
       const bridgeScheme = window.location.protocol === "https:" ? "wss" : "ws";
       client.connect({
-        url: `${bridgeScheme}://${window.location.host}/xr-agent-events`,
+        url: bridgeTargetUrl,
         scheme: bridgeScheme,
         host: window.location.hostname || "127.0.0.1",
         port: window.location.port ? Number.parseInt(window.location.port, 10) || 443 : 443,
@@ -1061,6 +1102,7 @@ export default function App() {
     }
 
     client.connect({
+      url: directTargetUrl,
       scheme,
       host: host.trim() || "127.0.0.1",
       port: Number.parseInt(port, 10) || 8765,
@@ -1255,6 +1297,7 @@ export default function App() {
     activeRealtimeVoiceRef.current = null;
     handledRealtimeFunctionCallsRef.current.clear();
     realtimeResponseInProgressRef.current = false;
+    pendingRealtimeFunctionResponseRef.current = false;
     realtimeNarrationEventIdsRef.current.clear();
     lastRealtimeNarrationRef.current = null;
     queuedRealtimeNarrationRef.current = null;
@@ -1312,6 +1355,12 @@ export default function App() {
     if (!realtime || realtime.dataChannel.readyState !== "open") {
       return;
     }
+    if (realtimeResponseInProgressRef.current) {
+      if (!instructions) {
+        pendingRealtimeFunctionResponseRef.current = true;
+      }
+      return;
+    }
     realtimeResponseInProgressRef.current = true;
     lastRealtimeVoiceActivityAtRef.current = Date.now();
     realtime.dataChannel.send(
@@ -1327,6 +1376,15 @@ export default function App() {
           : {}),
       }),
     );
+  }
+
+  function flushPendingRealtimeFunctionResponse() {
+    if (!pendingRealtimeFunctionResponseRef.current || realtimeResponseInProgressRef.current) {
+      return false;
+    }
+    pendingRealtimeFunctionResponseRef.current = false;
+    createRealtimeVoiceResponse();
+    return true;
   }
 
   function addRealtimeConversationText(text: string) {
@@ -1388,7 +1446,7 @@ export default function App() {
       instructions: [
         "This is a real backend update from the local Hermes supervisor or one of its coding workers.",
         "Do not call route_to_hermes for this backend update.",
-        "Speak as Hermes in first person and give the user the actual progress.",
+        "Speak as Hermy in first person and give the user the actual progress.",
         "Keep it to one or two short sentences.",
         "Stay sassy, bratty, and useful; a tiny playful check-in or roast is fine when the work is not failing.",
         "Do not claim the coding work is finished unless the backend update says it finished.",
@@ -1457,7 +1515,7 @@ export default function App() {
             "The app already routed the user's latest command to the local Hermes supervisor.",
             `User command: ${JSON.stringify(clippedTranscript)}.`,
             "Do not call route_to_hermes again for this acknowledgement.",
-            "Speak as Hermes in first person. Keep it under two short sentences.",
+            "Speak as Hermy in first person. Keep it under two short sentences.",
             "Be sassy, bratty, and useful. Say the worker/session/panels will show progress. You may add one tiny playful check-in or roast if it fits, but do not invent a reminder. Do not claim the coding work is finished yet.",
           ].join(" ")
         : [
@@ -1541,16 +1599,25 @@ export default function App() {
       lastRealtimeVoiceActivityAtRef.current = Date.now();
       setSpeechSpeaking(false);
       handleRealtimeFunctionCalls(eventRecord);
+      if (flushPendingRealtimeFunctionResponse()) {
+        return;
+      }
       flushQueuedRealtimeNarration();
       return;
     }
     if (type === "error") {
+      realtimeResponseInProgressRef.current = false;
+      setSpeechSpeaking(false);
       const error = eventRecord.error;
       const message =
         error && typeof error === "object" && typeof (error as Record<string, unknown>).message === "string"
           ? String((error as Record<string, unknown>).message)
           : "Realtime voice error.";
       client.noteStatus(message);
+      if (flushPendingRealtimeFunctionResponse()) {
+        return;
+      }
+      flushQueuedRealtimeNarration();
     }
   }
 
@@ -1589,13 +1656,17 @@ export default function App() {
               ok: sent,
               routed_text: routedText,
               message: sent
-                ? "Hermes accepted the command and is opening or updating the worker/session now. Acknowledge as Hermes in first person with a short sassy line. Do not claim the coding work is finished yet."
+                ? "Hermes accepted the command and is opening or updating the worker/session now. Acknowledge as Hermy in first person with a short sassy line. Do not claim the coding work is finished yet."
                 : "Could not route to the local Hermes supervisor.",
             }),
           },
         }),
       );
-      realtime.dataChannel.send(JSON.stringify({ type: "response.create" }));
+      if (realtimeResponseInProgressRef.current) {
+        pendingRealtimeFunctionResponseRef.current = true;
+      } else {
+        createRealtimeVoiceResponse();
+      }
     }
   }
 
@@ -1700,6 +1771,11 @@ export default function App() {
       dataChannel.addEventListener("open", () => {
         voiceReconnectAttemptRef.current = 0;
         realtimeResponseInProgressRef.current = false;
+        pendingRealtimeFunctionResponseRef.current = false;
+        const realtime = activeRealtimeVoiceRef.current;
+        if (realtime?.dataChannel === dataChannel && realtime.sessionConfig) {
+          dataChannel.send(JSON.stringify({ type: "session.update", session: realtime.sessionConfig }));
+        }
         lastRealtimeVoiceActivityAtRef.current = Date.now();
         lastRealtimeIdleBanterAtRef.current = Date.now();
         setVoiceConnecting(false);

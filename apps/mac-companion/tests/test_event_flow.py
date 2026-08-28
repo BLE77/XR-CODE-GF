@@ -10,6 +10,16 @@ from xr_agent.main import build_app, parse_args
 from xr_agent.models import SessionStatus
 
 
+def _wait_for_event(app, predicate, timeout: float = 2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        event = next((item for item in app.events.recent_serialized() if predicate(item)), None)
+        if event is not None:
+            return event
+        time.sleep(0.01)
+    raise AssertionError("expected event was not emitted before timeout")
+
+
 def test_parse_args_supports_show_events_flag() -> None:
     args = parse_args(["--repo", "/tmp/demo", "--once", "run tests", "--show-events"])
 
@@ -48,6 +58,7 @@ def test_voice_command_messages_are_routed_through_app_handler(tmp_path) -> None
         }
     )
 
+    _wait_for_event(app, lambda event: event["type"] == "agent.summary")
     event_types = [event["type"] for event in app.events.recent_serialized()]
 
     assert "speech.transcript" in event_types
@@ -70,6 +81,7 @@ def test_voice_audio_messages_are_transcribed_and_routed(tmp_path) -> None:
         }
     )
 
+    _wait_for_event(app, lambda event: event["type"] == "assistant.reply")
     events = app.events.recent_serialized()
 
     assert any(event["type"] == "hermes.status" for event in events)
@@ -90,6 +102,7 @@ def test_what_happened_emits_assistant_reply(tmp_path) -> None:
         }
     )
 
+    _wait_for_event(app, lambda event: event["type"] == "assistant.reply")
     event_types = [event["type"] for event in app.events.recent_serialized()]
 
     assert "assistant.reply" in event_types

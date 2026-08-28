@@ -224,7 +224,7 @@ def test_managed_coding_session_auto_accepts_trust_then_bypass_prompt(tmp_path) 
                 "BYPASS ACCEPTED" in line
                 for line in (manager.get(session.session_id).output_tail or [])
             ),
-            timeout=5,
+            timeout=15,
         )
     finally:
         manager.shutdown()

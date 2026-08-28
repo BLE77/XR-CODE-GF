@@ -71,17 +71,41 @@ The app can launch without every optional provider, but features turn on based o
 | Basic Quest UI + worker board | Mac companion running, Quest client running | The headset has no live backend connection |
 | Open Codex/Claude/Hermes workers | The matching CLI on your Mac `PATH` | That worker fails to open |
 | Open Kimi workers | `kimi` CLI installed and `kimi login` completed, or a valid `KIMI_API_KEY` | Kimi opens but cannot answer |
-| OpenAI Realtime voice | `OPENAI_API_KEY` in root `.env.local` | Live voice session fails or stays text-only |
+| OpenAI Realtime voice | Hermes `openai-codex` OAuth login in `~/.hermes/auth.json` | Live voice session fails or stays text-only |
 | ElevenLabs Yuki speech | `ELEVENLABS_API_KEY` and ideally `ELEVENLABS_VOICE_ID` in root `.env.local` | Backend TTS is disabled or falls back |
 | Quest Browser WebXR | HTTPS cert paths in `apps/metaquest-client/.env.local` | Quest may block XR/mic permissions |
 
 Minimum root `.env.local` for the full voice demo:
 
 ```sh
-OPENAI_API_KEY=
+OPENAI_REALTIME_PROFILE=demo
 ELEVENLABS_API_KEY=
 ELEVENLABS_VOICE_ID=
 ```
+
+Realtime voice profiles:
+
+- `OPENAI_REALTIME_PROFILE=demo`: lowest-latency funny demo/video mode. Defaults to `gpt-realtime-1.5`.
+- `OPENAI_REALTIME_PROFILE=operator`: smarter real-use mode for tool routing and ambiguous tasks. Defaults to `gpt-realtime-2` with low reasoning.
+
+Hermes should stay the main brain in both modes. The Realtime model is the fast mouth/ear; actionable coding, memory, worker, panel, and Yuki behavior requests route back to the Mac companion.
+
+## Shared Hermes Memory
+
+The Quest companion and the regular Hermes CLI should use the same Hermes identity and durable memory by default because they both run through your local Hermes install and profile under `~/.hermes`. They do not need to share the exact same chat transcript for this to work.
+
+For the seamless path:
+
+- Put long-term facts, preferences, reminders, and personality defaults in Hermes memory, not in the Quest browser.
+- Keep OpenAI Realtime as the fast voice layer only. It should route memory, reminder, worker, repo, UI, and Yuki behavior requests back to Hermes.
+- Start the Mac companion before opening the headset app so XR voice has the Hermes backend available.
+- When you want a normal terminal Hermes session that can also see/control the XR-managed workers, run:
+
+```sh
+./scripts/run-hermes-xr.sh
+```
+
+That helper launches `hermes -t xr-managed-sessions` with the XR control bridge env vars set. A plain `hermes` command still uses the same Hermes profile and memory, but it will not automatically see the live XR worker bridge unless those env vars are present.
 
 Recommended Quest client `.env.local`:
 
@@ -125,7 +149,12 @@ Expected output includes:
 ```text
 XR coding agent ready.
 WebSocket: ws://0.0.0.0:8765
+Pair once (expires ...): ?pair=ONE_TIME_CODE
 ```
+
+The external app-created event server requires authentication. Append the printed one-time pairing value to the Quest page URL (for example `https://MAC:5173/?pair=ONE_TIME_CODE`). The browser exchanges it once, stores the returned device token in local storage, and uses `?token=...` on later WebSocket connections. The Mac persists only salted PBKDF2 token hashes in `~/.xr-coding-agent/device-auth.json` (mode `0600`). Restart the companion to print a new five-minute pairing code.
+
+For direct TLS, set both `XR_AGENT_WSS_CERT` and `XR_AGENT_WSS_KEY`; the event server then listens with WSS. On a tailnet, prefer the Mac's Tailscale DNS name/IP and keep the port restricted to the tailnet with macOS firewall/Tailscale ACLs. Tailscale supplies private transport reachability, but device pairing is still required. Never expose plain `ws://0.0.0.0:8765` to the public internet.
 
 ## Run The Quest Client
 
@@ -173,14 +202,20 @@ When a worker opens, the worker activity panel should show the worker label, com
 
 ## Voice Modes
 
-OpenAI Realtime voice is handled server-side by the Mac companion. The headset never receives the real OpenAI API key.
+OpenAI Realtime voice is handled server-side by the Mac companion. The Mac reads the existing `openai-codex` OAuth token and account ID, posts the browser SDP to `/v1/realtime/calls`, and returns only the SDP answer plus non-secret session configuration to the requesting device. OAuth credentials are never broadcast or sent to the headset. The headset applies the session configuration with `session.update` after its WebRTC data channel opens.
 
 Recommended `.env.local` defaults:
 
 ```sh
-OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_PROFILE=demo
 OPENAI_REALTIME_VOICE=marin
 OPENAI_REALTIME_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+```
+
+For real-use testing where voice should be better at routing tools and state, switch to:
+
+```sh
+OPENAI_REALTIME_PROFILE=operator
 ```
 
 ElevenLabs streaming TTS is optional but useful for low-latency Yuki speech:
@@ -205,7 +240,7 @@ The Quest worker board should refresh through `coding_sessions.sync`. The respon
 - Worker board is empty: tap refresh workers or say `what coding sessions are open?`.
 - Kimi opens but does not answer: run `kimi login` again, and make sure `KIMI_API_KEY` is not set to an invalid key.
 - Browser preview works but Quest does not: test on the `https://YOUR_MAC_LAN_IP:5173` URL, not `localhost`.
-- Voice starts then stops: restart the realtime session and check that `OPENAI_API_KEY` is set only on the Mac.
+- Voice starts then stops: restart the realtime session and confirm Hermes has a valid `openai-codex` OAuth login on the Mac.
 
 ## Public Repo Safety
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
+import ssl
 import threading
 from collections import deque
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -9,6 +12,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable
 
+from xr_agent.device_pairing import DevicePairingAuth
 from xr_agent.models import AgentEvent
 
 try:  # pragma: no cover - optional dependency at runtime
@@ -49,7 +53,12 @@ class EventServer:
         "voice.realtime.sdp.answer",
     }
 
-    def __init__(self, max_events: int = 100) -> None:
+    def __init__(
+        self,
+        max_events: int = 100,
+        *,
+        auth: DevicePairingAuth | None = None,
+    ) -> None:
         self._events: deque[AgentEvent] = deque(maxlen=max_events)
         self._events_lock = threading.Lock()
         self._subscribers: set[asyncio.Queue[str | None]] = set()
@@ -58,16 +67,27 @@ class EventServer:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._bound_port: int | None = None
-        self._message_handler: Callable[[dict[str, Any]], None] | None = None
+        self._message_handler: Callable[..., None] | None = None
+        self._message_handler_accepts_reply = False
+        self.auth = auth
 
-    def set_message_handler(self, handler: Callable[[dict[str, Any]], None]) -> None:
+    def set_message_handler(self, handler: Callable[..., None]) -> None:
         self._message_handler = handler
+        self._message_handler_accepts_reply = len(inspect.signature(handler).parameters) >= 2
 
     async def start(self, host: str, port: int) -> None:
         if websockets is None:
             raise RuntimeError("websockets is required to start the event server")
         self._loop = asyncio.get_running_loop()
-        self._server = await websockets.serve(self._handle_client, host, port)
+        ssl_context = None
+        cert_path = os.environ.get("XR_AGENT_WSS_CERT", "").strip()
+        key_path = os.environ.get("XR_AGENT_WSS_KEY", "").strip()
+        if cert_path or key_path:
+            if not cert_path or not key_path:
+                raise RuntimeError("XR_AGENT_WSS_CERT and XR_AGENT_WSS_KEY must be set together")
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(cert_path, key_path)
+        self._server = await websockets.serve(self._handle_client, host, port, ssl=ssl_context)
         sockets = getattr(self._server, "sockets", None) or []
         self._bound_port = int(sockets[0].getsockname()[1]) if sockets else port
 
@@ -284,6 +304,16 @@ class EventServer:
 
     async def _handle_client(self, websocket: Any) -> None:
         queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=200)
+        if self.auth is not None:
+            request = getattr(websocket, "request", None)
+            path = getattr(request, "path", None) or getattr(websocket, "path", "")
+            grant = self.auth.authenticate_path(path)
+            if grant is None:
+                await websocket.close(code=4401, reason="pairing or device token required")
+                return
+            if grant.device_token is not None:
+                paired = make_event("auth.paired", None, {"device_token": grant.device_token})
+                self._enqueue_message(queue, self._wire_message(paired, max_bytes=self._MAX_LIVE_EVENT_BYTES))
         with self._subscribers_lock:
             self._subscribers.add(queue)
         with self._events_lock:
@@ -299,7 +329,7 @@ class EventServer:
             async for raw_message in websocket:
                 # Keep the websocket loop responsive even when the app handler does
                 # heavier work like launching or routing coding sessions.
-                await asyncio.to_thread(self._handle_client_message, raw_message)
+                await asyncio.to_thread(self._handle_client_message, raw_message, queue)
         except ConnectionClosed:
             pass
         finally:
@@ -319,7 +349,7 @@ class EventServer:
             except ConnectionClosed:
                 break
 
-    def _handle_client_message(self, raw_message: Any) -> None:
+    def _handle_client_message(self, raw_message: Any, queue: asyncio.Queue[str | None] | None = None) -> None:
         handler = self._message_handler
         if handler is None:
             return
@@ -341,7 +371,14 @@ class EventServer:
         if not isinstance(payload, dict):
             return
 
-        handler(payload)
+        if self._message_handler_accepts_reply:
+            def reply(event: AgentEvent) -> None:
+                if queue is not None:
+                    self._publish_to_queue(queue, self._wire_message(event, max_bytes=self._MAX_LIVE_EVENT_BYTES))
+
+            handler(payload, reply)
+        else:
+            handler(payload)
 
 
 def make_event(event_type: str, session_id: str | None, payload: dict[str, Any]) -> AgentEvent:

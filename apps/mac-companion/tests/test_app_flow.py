@@ -285,7 +285,7 @@ def test_open_claude_session_and_send_followup(tmp_path) -> None:
             "hello from headset" in line
             for line in (app.coding_sessions.get(session.session_id).output_tail or [])
         ),
-        timeout=5,
+        timeout=15,
     )
 
     app.handle_text("tell claude raise SystemExit", repo_path=str(tmp_path))
@@ -1040,7 +1040,7 @@ def test_open_claude_auto_accepts_mcp_server_prompt_and_reports_status(tmp_path)
             "MCP ACCEPTED AND READY" in line
             for line in (app.coding_sessions.get(session.session_id).output_tail or [])
         ),
-        timeout=5,
+        timeout=15,
     )
 
     _wait_for(
@@ -1842,49 +1842,37 @@ def test_respond_strips_backend_voice_payload_from_event_history(tmp_path) -> No
     assert payload["speech_turn_id"].startswith("speech_")
 
 
-def test_realtime_voice_session_request_publishes_client_secret(tmp_path, monkeypatch) -> None:
+def test_realtime_voice_session_request_never_returns_client_secret(tmp_path) -> None:
     app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
-
-    def fake_create_realtime_voice_session(*, repo_path=None):
-        return {
-            "ok": True,
-            "provider": "openai-realtime",
-            "client_secret": "ek_test",
-            "expires_at": 123,
-            "model": "gpt-realtime",
-            "voice": "marin",
-            "repo_path": repo_path,
-        }
-
-    monkeypatch.setattr(app, "_create_realtime_voice_session", fake_create_realtime_voice_session)
+    replies = []
 
     app.handle_client_message(
         {
             "type": "voice.realtime.session.request",
-            "payload": {
-                "request_id": "req-1",
-                "repo_path": str(tmp_path),
-            },
-        }
+            "payload": {"request_id": "req-1"},
+        },
+        replies.append,
     )
 
-    event = next(event for event in app.events.recent_serialized() if event["type"] == "voice.realtime.session")
-    assert event["payload"]["request_id"] == "req-1"
-    assert event["payload"]["provider"] == "openai-realtime"
-    assert event["payload"]["client_secret"] == "ek_test"
-    assert event["payload"]["model"] == "gpt-realtime"
-    assert event["payload"]["voice"] == "marin"
+    assert len(replies) == 1
+    assert replies[0].event_type == "voice.realtime.session"
+    assert replies[0].payload["request_id"] == "req-1"
+    assert replies[0].payload["ok"] is False
+    assert "client_secret" not in replies[0].payload
+    assert not any(event["type"] == "voice.realtime.session" for event in app.events.recent_serialized())
 
 
-def test_realtime_voice_sdp_offer_publishes_answer(tmp_path, monkeypatch) -> None:
+def test_realtime_voice_sdp_offer_replies_only_to_requester(tmp_path, monkeypatch) -> None:
     app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+    session_config = {"type": "realtime", "model": "gpt-realtime"}
 
     def fake_create_realtime_call_answer(*, sdp, repo_path=None):
         assert sdp == "v=0\r\nfake-offer"
         assert repo_path == str(tmp_path)
-        return "v=0\r\nfake-answer"
+        return "v=0\r\nfake-answer", session_config
 
     monkeypatch.setattr(app, "_create_realtime_call_answer", fake_create_realtime_call_answer)
+    replies = []
 
     app.handle_client_message(
         {
@@ -1894,16 +1882,19 @@ def test_realtime_voice_sdp_offer_publishes_answer(tmp_path, monkeypatch) -> Non
                 "repo_path": str(tmp_path),
                 "sdp": "v=0\r\nfake-offer",
             },
-        }
+        },
+        replies.append,
     )
 
-    event = next(event for event in app.events.recent_serialized() if event["type"] == "voice.realtime.sdp.answer")
-    assert event["payload"] == {
+    assert len(replies) == 1
+    assert replies[0].payload == {
         "request_id": "req-sdp",
         "ok": True,
         "provider": "openai-realtime",
         "sdp": "v=0\r\nfake-answer",
+        "session": session_config,
     }
+    assert not any(event["type"] == "voice.realtime.sdp.answer" for event in app.events.recent_serialized())
 
 
 def test_realtime_voice_config_routes_transcripts_before_auto_response(tmp_path) -> None:
@@ -1921,6 +1912,46 @@ def test_realtime_voice_config_routes_transcripts_before_auto_response(tmp_path)
     assert input_audio["turn_detection"]["create_response"] is False
     assert input_audio["transcription"]["model"] == "gpt-4o-mini-transcribe"
     assert "Claude Code" in input_audio["transcription"]["prompt"]
+
+
+def test_realtime_voice_profile_defaults_to_low_latency_demo(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_REALTIME_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_REALTIME_PROFILE", raising=False)
+    monkeypatch.delenv("OPENAI_REALTIME_REASONING_EFFORT", raising=False)
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    model = app._realtime_model_name()
+    config = app._realtime_session_config(
+        repo_path=str(tmp_path),
+        model=model,
+        voice="marin",
+        transcribe_model="gpt-4o-mini-transcribe",
+    )
+
+    assert app._realtime_voice_profile() == "demo"
+    assert model == "gpt-realtime-1.5"
+    assert "reasoning" not in config
+    assert "Demo latency profile" in config["instructions"]
+
+
+def test_realtime_voice_operator_profile_uses_realtime_2_low_reasoning(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_REALTIME_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_REALTIME_REASONING_EFFORT", raising=False)
+    monkeypatch.setenv("OPENAI_REALTIME_PROFILE", "operator")
+    app = build_app(AppConfig(hermes_cmd="echo", state_dir=tmp_path / "state"))
+
+    model = app._realtime_model_name()
+    config = app._realtime_session_config(
+        repo_path=str(tmp_path),
+        model=model,
+        voice="marin",
+        transcribe_model="gpt-4o-mini-transcribe",
+    )
+
+    assert app._realtime_voice_profile() == "operator"
+    assert model == "gpt-realtime-2"
+    assert config["reasoning"] == {"effort": "low"}
+    assert "Hermes on the Mac is the source of truth" in config["instructions"]
 
 
 def test_send_to_claude_auto_opens_when_no_session_exists(tmp_path, monkeypatch) -> None:

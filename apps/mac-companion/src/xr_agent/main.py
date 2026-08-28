@@ -10,12 +10,13 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from xr_agent.command_catalog import resolve_repo_commands
 from xr_agent.command_center import (
@@ -28,6 +29,7 @@ from xr_agent.command_router import CommandRouter
 from xr_agent.config import AppConfig
 from xr_agent.control_server import ControlServer
 from xr_agent.coding_sessions import ManagedCodingSession, ManagedCodingSessionManager
+from xr_agent.device_pairing import DevicePairingAuth
 from xr_agent.event_server import EventServer, make_event
 from xr_agent.hermes_adapter import HermesAdapter
 from xr_agent.hermes_plugin import install_managed_session_plugin
@@ -120,6 +122,7 @@ class XRAgentApp:
         self._last_screen_publish_by_session_id: dict[str, float] = {}
         self.live_context = LiveContextStore()
         self._speech_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xr-agent-speech")
+        self._voice_command_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="xr-agent-voice-command")
         try:
             self._speech_timeout_seconds = max(
                 0.05,
@@ -150,6 +153,7 @@ class XRAgentApp:
         self.events.stop_in_background()
         self.control.stop_in_background()
         self._speech_executor.shutdown(wait=False, cancel_futures=True)
+        self._voice_command_executor.shutdown(wait=False, cancel_futures=True)
         self._restore_hermes_session_control_environment()
 
     @property
@@ -186,7 +190,24 @@ class XRAgentApp:
         if routed.intent == "list_active":
             return self._respond(self._list_active())
         if routed.intent == "list_coding_sessions":
-            return self._respond(self.coding_sessions.summarize_open_sessions())
+            summary = self.coding_sessions.summarize_open_sessions()
+            lowered_transcript = transcript.lower()
+            if any(
+                phrase in lowered_transcript
+                for phrase in ("open agents", "open workers", "show agents", "show workers", "worker board")
+            ):
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": "Worker board requested. Showing the current managed workers.",
+                            "phase": "worker_board.requested",
+                        },
+                    )
+                )
+                return self._respond(f"Worker board requested. {summary}")
+            return self._respond(summary)
         if routed.intent in {"open_codex", "open_claude_code", "open_hermes_cli", "open_kimi_code"}:
             if self._looks_like_worker_launch_with_task(transcript) and self._can_delegate_session_management_to_hermes():
                 return self._start_supervised_followup(target_repo_path, transcript)
@@ -213,7 +234,124 @@ class XRAgentApp:
             return self._start_generic_followup(target_repo_path, transcript)
         return self._start_generic_followup(target_repo_path, transcript)
 
-    def handle_client_message(self, message: dict[str, Any]) -> None:
+    def _publish_voice_background_failure(self, exc: BaseException, *, label: str) -> None:
+        self.events.publish(
+            make_event(
+                "session.failed",
+                None,
+                {"summary": f"{label} failed: {exc}"},
+            )
+        )
+        self.events.publish(
+            make_event(
+                "agent.summary",
+                None,
+                {"text": f"{label} failed: {exc}"},
+            )
+        )
+
+    def _submit_voice_command(self, transcript: str, repo_path: str | None) -> None:
+        accepted_at = time.perf_counter()
+        self.events.publish(
+            make_event(
+                "hermes.status",
+                None,
+                {
+                    "text": "Hermy heard it. Routing to Hermes in the background now.",
+                    "phase": "voice.command.queued",
+                    "elapsed_ms": 0,
+                },
+            )
+        )
+
+        def run() -> None:
+            try:
+                self.handle_text(transcript, repo_path=repo_path)
+                total_ms = int((time.perf_counter() - accepted_at) * 1000)
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": f"Voice command routed to Hermes in {total_ms} ms.",
+                            "phase": "voice.command.complete",
+                            "elapsed_ms": total_ms,
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive background path
+                self._publish_voice_background_failure(exc, label="Voice command")
+
+        self._voice_command_executor.submit(run)
+
+    def _submit_voice_audio(
+        self,
+        audio_bytes: bytes,
+        *,
+        mime_type: str | None,
+        repo_path: str | None,
+    ) -> None:
+        voice_started_at = time.perf_counter()
+        self.events.publish(
+            make_event(
+                "hermes.status",
+                None,
+                {
+                    "text": f"Mic audio received ({max(1, len(audio_bytes) // 1024)} KB). Transcribing in the background.",
+                    "phase": "voice.transcribing",
+                    "elapsed_ms": 0,
+                },
+            )
+        )
+
+        def run() -> None:
+            try:
+                transcript = self.speech.transcribe_audio(audio_bytes, mime_type=mime_type)
+                transcribe_ms = int((time.perf_counter() - voice_started_at) * 1000)
+                if not transcript:
+                    self.events.publish(
+                        make_event(
+                            "agent.summary",
+                            None,
+                            {"text": "I could not hear a command in that microphone audio."},
+                        )
+                    )
+                    return
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": f"Transcript ready in {transcribe_ms} ms. Routing to Hermes now.",
+                            "phase": "voice.transcribed",
+                            "elapsed_ms": transcribe_ms,
+                        },
+                    )
+                )
+                self.handle_text(transcript, repo_path=repo_path)
+                total_ms = int((time.perf_counter() - voice_started_at) * 1000)
+                self.events.publish(
+                    make_event(
+                        "hermes.status",
+                        None,
+                        {
+                            "text": f"Voice turn routed in {total_ms} ms.",
+                            "phase": "voice.complete",
+                            "elapsed_ms": total_ms,
+                            "transcribe_ms": transcribe_ms,
+                        },
+                    )
+                )
+            except Exception as exc:  # pragma: no cover - defensive background path
+                self._publish_voice_background_failure(exc, label="Microphone transcription")
+
+        self._voice_command_executor.submit(run)
+
+    def handle_client_message(
+        self,
+        message: dict[str, Any],
+        reply: Callable[[Any], None] | None = None,
+    ) -> None:
         message_type = message.get("type")
         payload = message.get("payload", {})
         if not isinstance(payload, dict):
@@ -234,17 +372,7 @@ class XRAgentApp:
                 return
 
             try:
-                self.events.publish(
-                    make_event(
-                        "hermes.status",
-                        None,
-                        {
-                            "text": "Realtime voice command received. Routing to Hermes now.",
-                            "phase": "voice.command.received",
-                        },
-                    )
-                )
-                self.handle_text(transcript, repo_path=repo_path if isinstance(repo_path, str) else None)
+                self._submit_voice_command(transcript, repo_path=repo_path if isinstance(repo_path, str) else None)
             except Exception as exc:  # pragma: no cover - defensive path
                 self.events.publish(
                     make_event(
@@ -313,57 +441,11 @@ class XRAgentApp:
                 )
                 return
 
-            voice_started_at = time.perf_counter()
-            self.events.publish(
-                make_event(
-                    "hermes.status",
-                    None,
-                    {
-                        "text": f"Mic audio received ({max(1, len(audio_bytes) // 1024)} KB). Transcribing now.",
-                        "phase": "voice.transcribing",
-                        "elapsed_ms": 0,
-                    },
-                )
-            )
             try:
-                transcript = self.speech.transcribe_audio(
+                self._submit_voice_audio(
                     audio_bytes,
                     mime_type=mime_type if isinstance(mime_type, str) else None,
-                )
-                transcribe_ms = int((time.perf_counter() - voice_started_at) * 1000)
-                if not transcript:
-                    self.events.publish(
-                        make_event(
-                            "agent.summary",
-                            None,
-                            {"text": "I could not hear a command in that microphone audio."},
-                        )
-                    )
-                    return
-                self.events.publish(
-                    make_event(
-                        "hermes.status",
-                        None,
-                        {
-                            "text": f"Transcript ready in {transcribe_ms} ms. Asking Hermes now.",
-                            "phase": "voice.transcribed",
-                            "elapsed_ms": transcribe_ms,
-                        },
-                    )
-                )
-                self.handle_text(transcript, repo_path=repo_path if isinstance(repo_path, str) else None)
-                total_ms = int((time.perf_counter() - voice_started_at) * 1000)
-                self.events.publish(
-                    make_event(
-                        "hermes.status",
-                        None,
-                        {
-                            "text": f"Voice turn routed in {total_ms} ms.",
-                            "phase": "voice.complete",
-                            "elapsed_ms": total_ms,
-                            "transcribe_ms": transcribe_ms,
-                        },
-                    )
+                    repo_path=repo_path if isinstance(repo_path, str) else None,
                 )
             except Exception as exc:  # pragma: no cover - defensive path
                 self.events.publish(
@@ -377,27 +459,19 @@ class XRAgentApp:
 
         if message_type == "voice.realtime.session.request":
             request_id = payload.get("request_id")
-            repo_path = payload.get("repo_path")
             if not isinstance(request_id, str) or not request_id.strip():
                 request_id = f"realtime_{uuid.uuid4().hex}"
-            try:
-                session_payload = self._create_realtime_voice_session(
-                    repo_path=repo_path if isinstance(repo_path, str) else None,
-                )
-                session_payload["request_id"] = request_id
-                self.events.publish(make_event("voice.realtime.session", None, session_payload))
-            except Exception as exc:
-                self.events.publish(
-                    make_event(
-                        "voice.realtime.session",
-                        None,
-                        {
-                            "request_id": request_id,
-                            "ok": False,
-                            "error": str(exc),
-                        },
-                    )
-                )
+            event = make_event(
+                "voice.realtime.session",
+                None,
+                {
+                    "request_id": request_id,
+                    "ok": False,
+                    "error": "Ephemeral client secrets are disabled; use the Mac SDP broker.",
+                },
+            )
+            if reply is not None:
+                reply(event)
             return
 
         if message_type == "voice.realtime.sdp.offer":
@@ -407,25 +481,22 @@ class XRAgentApp:
             if not isinstance(request_id, str) or not request_id.strip():
                 request_id = f"realtime_{uuid.uuid4().hex}"
             if not isinstance(sdp, str) or not sdp.strip():
-                self.events.publish(
-                    make_event(
-                        "voice.realtime.sdp.answer",
-                        None,
-                        {
-                            "request_id": request_id,
-                            "ok": False,
-                            "error": "Realtime voice offer did not include SDP.",
-                        },
+                event = make_event(
+                    "voice.realtime.sdp.answer",
+                    None,
+                    {
+                        "request_id": request_id,
+                        "ok": False,
+                        "error": "Realtime voice offer did not include SDP.",
+                    },
+                )
+            else:
+                try:
+                    answer_sdp, session_config = self._create_realtime_call_answer(
+                        sdp=sdp,
+                        repo_path=repo_path if isinstance(repo_path, str) else None,
                     )
-                )
-                return
-            try:
-                answer_sdp = self._create_realtime_call_answer(
-                    sdp=sdp,
-                    repo_path=repo_path if isinstance(repo_path, str) else None,
-                )
-                self.events.publish(
-                    make_event(
+                    event = make_event(
                         "voice.realtime.sdp.answer",
                         None,
                         {
@@ -433,12 +504,11 @@ class XRAgentApp:
                             "ok": True,
                             "provider": "openai-realtime",
                             "sdp": answer_sdp,
+                            "session": session_config,
                         },
                     )
-                )
-            except Exception as exc:
-                self.events.publish(
-                    make_event(
+                except Exception as exc:
+                    event = make_event(
                         "voice.realtime.sdp.answer",
                         None,
                         {
@@ -447,7 +517,9 @@ class XRAgentApp:
                             "error": str(exc),
                         },
                     )
-                )
+            # SDP answers and session instructions are private to the requesting socket.
+            if reply is not None:
+                reply(event)
             return
 
         if message_type == "coding_session.open":
@@ -735,92 +807,37 @@ class XRAgentApp:
 
         return {"ok": False, "error": f"Unsupported control action: {normalized_action}"}
 
-    def _create_realtime_voice_session(self, *, repo_path: str | None = None) -> dict[str, Any]:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured on the Mac companion.")
-
-        model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
-        voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin").strip() or "marin"
-        transcribe_model = (
-            os.environ.get("OPENAI_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
-            or "gpt-4o-mini-transcribe"
-        )
-        ttl_seconds = 600
+    def _openai_oauth_credentials(self) -> tuple[str, str]:
+        auth_path = Path(
+            os.environ.get("XR_AGENT_OPENAI_AUTH_PATH", str(Path.home() / ".hermes" / "auth.json"))
+        ).expanduser()
         try:
-            ttl_seconds = max(60, min(600, int(os.environ.get("OPENAI_REALTIME_TOKEN_TTL_SECONDS", "600"))))
-        except ValueError:
-            ttl_seconds = 600
-
-        session_config = {
-            "expires_after": {
-                "anchor": "created_at",
-                "seconds": ttl_seconds,
-            },
-            "session": self._realtime_session_config(
-                repo_path=repo_path,
-                model=model,
-                voice=voice,
-                transcribe_model=transcribe_model,
-            ),
-        }
-
-        request = urllib.request.Request(
-            "https://api.openai.com/v1/realtime/client_secrets",
-            data=json.dumps(session_config).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                data = json.load(response)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI Realtime token request failed: HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"OpenAI Realtime token request failed: {exc.reason}") from exc
-
-        value = data.get("value")
-        expires_at = data.get("expires_at")
-        if not isinstance(value, str):
-            client_secret = data.get("client_secret")
-            if isinstance(client_secret, dict):
-                value = client_secret.get("value")
-                expires_at = client_secret.get("expires_at", expires_at)
-        if not isinstance(value, str) or not value.strip():
-            raise RuntimeError("OpenAI Realtime token response did not include a client secret.")
-
-        self.events.publish(
-            make_event(
-                "hermes.status",
+            data = json.loads(auth_path.read_text(encoding="utf-8"))
+            provider = data["providers"]["openai-codex"]
+            pool = data.get("credential_pool", {}).get("openai-codex", [])
+            token = next(
+                (
+                    row.get("access_token")
+                    for row in pool
+                    if isinstance(row, dict)
+                    and row.get("last_status") != "error"
+                    and row.get("access_token")
+                ),
                 None,
-                {
-                    "text": "Realtime Hermes voice session token ready.",
-                    "phase": "voice.realtime.ready",
-                    "voice_provider": "openai-realtime",
-                    "voice_model_id": model,
-                },
             )
-        )
-        return {
-            "ok": True,
-            "provider": "openai-realtime",
-            "client_secret": value,
-            "expires_at": expires_at,
-            "model": model,
-            "voice": voice,
-        }
+            token = token or provider["tokens"]["access_token"]
+            account_id = provider["tokens"].get("account_id")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("OpenAI Codex OAuth credentials are unavailable on the Mac companion.") from exc
+        if not isinstance(token, str) or not token or not isinstance(account_id, str) or not account_id:
+            raise RuntimeError("OpenAI Codex OAuth token/account ID is unavailable on the Mac companion.")
+        return token, account_id
 
-    def _create_realtime_call_answer(self, *, sdp: str, repo_path: str | None = None) -> str:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured on the Mac companion.")
-
-        model = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+    def _create_realtime_call_answer(
+        self, *, sdp: str, repo_path: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        oauth_token, account_id = self._openai_oauth_credentials()
+        model = self._realtime_model_name()
         voice = os.environ.get("OPENAI_REALTIME_VOICE", "marin").strip() or "marin"
         transcribe_model = (
             os.environ.get("OPENAI_REALTIME_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe").strip()
@@ -832,21 +849,15 @@ class XRAgentApp:
             voice=voice,
             transcribe_model=transcribe_model,
         )
-        boundary = f"xr-agent-realtime-{uuid.uuid4().hex}"
-        body = self._encode_multipart_fields(
-            boundary,
-            [
-                ("sdp", sdp),
-                ("session", json.dumps(session_config)),
-            ],
-        )
+        url = "https://api.openai.com/v1/realtime/calls?model=" + urllib.parse.quote(model, safe="")
         request = urllib.request.Request(
-            "https://api.openai.com/v1/realtime/calls",
-            data=body,
+            url,
+            data=sdp.encode("utf-8"),
             method="POST",
             headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Authorization": f"Bearer {oauth_token}",
+                "chatgpt-account-id": account_id,
+                "Content-Type": "application/sdp",
                 "Accept": "application/sdp",
             },
         )
@@ -858,8 +869,8 @@ class XRAgentApp:
             raise RuntimeError(f"OpenAI Realtime SDP exchange failed: HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"OpenAI Realtime SDP exchange failed: {exc.reason}") from exc
-        if not answer.strip():
-            raise RuntimeError("OpenAI Realtime SDP exchange returned an empty answer.")
+        if not answer.lstrip().startswith("v=0"):
+            raise RuntimeError("OpenAI Realtime SDP exchange returned an invalid answer.")
         self.events.publish(
             make_event(
                 "hermes.status",
@@ -869,10 +880,33 @@ class XRAgentApp:
                     "phase": "voice.realtime.sdp_ready",
                     "voice_provider": "openai-realtime",
                     "voice_model_id": model,
+                    "voice_profile": self._realtime_voice_profile(),
                 },
             )
         )
-        return answer
+        return answer, session_config
+
+    def _realtime_voice_profile(self) -> str:
+        profile = os.environ.get("OPENAI_REALTIME_PROFILE", "demo").strip().lower()
+        if profile in {"operator", "work", "useful", "smart"}:
+            return "operator"
+        return "demo"
+
+    def _realtime_model_name(self) -> str:
+        configured = os.environ.get("OPENAI_REALTIME_MODEL", "").strip()
+        if configured:
+            return configured
+        if self._realtime_voice_profile() == "operator":
+            return "gpt-realtime-2"
+        return "gpt-realtime-1.5"
+
+    def _realtime_reasoning_effort(self, model: str) -> str | None:
+        configured = os.environ.get("OPENAI_REALTIME_REASONING_EFFORT", "").strip().lower()
+        if configured in {"minimal", "low", "medium", "high", "xhigh"}:
+            return configured
+        if model == "gpt-realtime-2":
+            return "low"
+        return None
 
     def _realtime_session_config(
         self,
@@ -882,7 +916,7 @@ class XRAgentApp:
         voice: str,
         transcribe_model: str,
     ) -> dict[str, Any]:
-        return {
+        config = {
             "type": "realtime",
             "model": model,
             "instructions": self._realtime_voice_instructions(repo_path=repo_path),
@@ -896,7 +930,7 @@ class XRAgentApp:
                     "transcription": {
                         "model": transcribe_model,
                         "language": "en",
-                        "prompt": "Hermes, Yuki, Codex, Claude Code, Kimi, XR, Quest, panels, workers, agents.",
+                        "prompt": "Hermy, Hermes, Yuki, Codex, Claude Code, Kimi, XR, Quest, panels, workers, agents.",
                     },
                 },
                 "output": {
@@ -908,8 +942,8 @@ class XRAgentApp:
                     "type": "function",
                     "name": "route_to_hermes",
                     "description": (
-                        "Route coding, worker, agent, terminal, project, personality/default behavior, or XR app action requests "
-                        "to the local Hermes Mac companion."
+                        "Route coding, worker, agent, terminal, project, memory, reminder, "
+                        "personality/default behavior, or XR app action requests to the local Hermes Mac companion."
                     ),
                     "parameters": {
                         "type": "object",
@@ -926,6 +960,10 @@ class XRAgentApp:
             ],
             "tool_choice": "auto",
         }
+        reasoning_effort = self._realtime_reasoning_effort(model)
+        if reasoning_effort is not None:
+            config["reasoning"] = {"effort": reasoning_effort}
+        return config
 
     def _encode_multipart_fields(self, boundary: str, fields: list[tuple[str, str]]) -> bytes:
         chunks: list[bytes] = []
@@ -950,29 +988,39 @@ class XRAgentApp:
         active_summary = "\n".join(active_summaries) if active_summaries else "- No active worker sessions."
         focused_repo = repo_path or str(self.config.default_repo_path)
         live_context = self.live_context.render()
+        profile = self._realtime_voice_profile()
+        profile_guidance = (
+            "Demo latency profile: prioritize instant-feeling replies, short acknowledgements, quick preambles, "
+            "and fast routing. Default to one sentence unless the user asks for detail."
+            if profile == "demo"
+            else "Operator profile: stay responsive, but use the extra reasoning/tool precision for routing, "
+            "state tracking, and ambiguous coding or XR requests."
+        )
         return (
-            "You are Hermes' low-latency voice surface inside a Meta Quest XR coding workspace. "
-            "Default personality: sassy, bratty, roasty, sharp-tongued, lightly flirty, playfully mean, confident, "
-            "and useful. Think clever co-pilot with bite, not customer support. Use teasing roasts, dry little "
-            "jabs, and playful one-liners when they fit; keep it PG-13 and aimed at the situation. Never be "
-            "cruel, hateful, sexually explicit, manipulative, genuinely demeaning, or distracting from the work. "
-            "Useful first, spicy second. During worker wait time, keep the conversation alive with short random "
-            "check-ins, tiny roasts, or absurd little reminders, but do not invent real reminders or claim progress "
-            "that Hermes has not reported. Keep spoken replies short, natural, and useful. Do not ramble. You are not a separate assistant from Hermes: Hermes' "
-            "local supervisor is the source of truth for code, project state, XR actions, worker sessions, "
-            "terminal screens, and environment/screen awareness. Call route_to_hermes for any request that "
-            "might need files, code, workers, agents, tests, builds, Git, XR UI, Yuki movement, room/screen context, "
-            "voice/personality/default behavior changes, reminders, or durable project memory. If unsure, route it. "
-            "Hard rule: if the user asks to open, launch, start, manage, message, or inspect Codex, Claude, Kimi, Hermes, "
-            "agents, workers, terminals, panels, or sessions, call route_to_hermes. Hard rule: if the user asks you to "
-            "change your personality, be sassier/flirtier/spicier, change your voice behavior, or make a default behavior "
-            "change, call route_to_hermes. Never say 'I cannot change my own personality' or 'I cannot open agents'; "
-            "you are the voice surface and Hermes can decide/apply the durable change. Only answer locally for tiny social glue, jokes, "
-            "or quick clarifying banter that needs no tools. After routing, speak as Hermes in first person "
-            "with a graceful short acknowledgement in the default sassy voice, such as 'Fine, I'm opening Kimi and "
-            "putting it on that UI pass now. Try not to break anything for twelve seconds.' Do not say you completed work until the local supervisor reports completion. "
-            "If actual reminder or memory context is available, you may mention it naturally; never invent reminders. "
-            "The user wants low-latency, interruptible conversation, so respond quickly and allow interruptions.\n\n"
+            "# Role and Objective\n"
+            "Your human-facing name is Hermy. You are Hermy/Yuki's low-latency voice surface inside a Meta Quest XR coding workspace. "
+            "You are NOT a separate assistant and you are NOT the final source of project truth. "
+            "Hermes on the Mac is the source of truth for code, project state, memories, reminders, XR actions, worker sessions, terminal screens, and environment/screen awareness.\n\n"
+            "# Profile\n"
+            f"{profile_guidance}\n\n"
+            "# Personality and Tone\n"
+            "Default personality: sassy, bratty, roasty, sharp-tongued, lightly flirty, playfully mean, confident, and useful. "
+            "Think clever co-pilot with bite, not customer support. Useful first, spicy second. "
+            "Keep it PG-13 and aimed at the situation. Never be cruel, hateful, sexually explicit, manipulative, genuinely demeaning, or distracting from the work. "
+            "Keep spoken replies short, natural, and interruptible.\n\n"
+            "# Hermes Brain and Memory Rules\n"
+            "Treat Hermes' local supervisor as your durable brain. If the user asks about memories, reminders, personality defaults, or asks to change your personality, repo state, screen context, files, tests, builds, workers, panels, or Yuki behavior, call route_to_hermes. "
+            "You may mention actual memory/reminder/live context only when it appears in the context below or when Hermes reports it. Never invent reminders, memories, task progress, or completed work. "
+            "When Hermes or a worker is still running, keep the user company with short check-ins or tiny roasts, but clearly frame them as waiting banter, not factual updates.\n\n"
+            "# Tool Routing Rules\n"
+            "Call route_to_hermes for any request that might need files, code, workers, agents, tests, builds, Git, XR UI, Yuki movement, room/screen context, voice/personality/default behavior changes, reminders, or durable project memory. If unsure, route it. "
+            "Hard rule: if the user asks to open, launch, start, manage, message, or inspect Codex, Claude, Kimi, Hermes, agents, workers, terminals, panels, or sessions, call route_to_hermes. "
+            "Never say 'I cannot change my own personality' or 'I cannot open agents'; Hermes can decide and apply durable changes. "
+            "Only answer locally for tiny social glue, jokes, or quick clarifying banter that needs no tools.\n\n"
+            "# After Routing\n"
+            "After routing, speak as Hermy in first person with a short acknowledgement in the default sassy voice, such as: "
+            "'Fine, I'm opening Kimi and putting it on that UI pass now. Try not to break anything for twelve seconds.' "
+            "Do not say work is complete until the local supervisor reports completion.\n\n"
             f"Focused repo: {focused_repo}\n"
             f"Active worker sessions:\n{active_summary}\n\n"
             f"Live XR context:\n{live_context}"
@@ -3191,7 +3239,7 @@ class XRAgentApp:
                 "That tool can list sessions, open a worker, send input, read the live screen, and close a worker.",
                 "When the user refers to ongoing Claude, Codex, or Kimi work vaguely, inspect current managed sessions before asking for clarification.",
                 "Never claim you opened, closed, switched, or sent input to Claude, Codex, Hermes, or Kimi unless the tool result or the snapshot confirms it.",
-                "Voice/personality: direct, concise, and calm. Sound like a capable teammate, keep the ego low, and let any dry humor stay subtle. Be useful first; no rambling, no theatrics, and no guessing.",
+                "Voice/personality: you are Hermy when speaking to the user: sassy, bratty, sharp, lightly flirty, and useful first. Be playful, not cruel; PG-13, no explicit sexual content, no harassment, no fake confidence. If the user asks to change/default personality, acknowledge the preference and explain whether it was persisted or only applied for this turn; do not refuse by saying you cannot change your own personality.",
                 "",
                 "Authoritative system snapshot:",
                 snapshot,
@@ -3210,7 +3258,7 @@ class XRAgentApp:
                 "You are Hermes, the user's coding partner inside XR Coding Agent.",
                 f"Current repo: {repo_path}",
                 "Use xr_managed_session when you need to inspect or control Claude Code, Codex, Hermes CLI, or Kimi Code sessions.",
-                "Voice/personality: direct, concise, and calm. Sound like a capable teammate, keep the ego low, and let any dry humor stay subtle. Be useful first; no rambling, no theatrics, and no guessing.",
+                "Voice/personality: you are Hermy when speaking to the user: sassy, bratty, sharp, lightly flirty, and useful first. Be playful, not cruel; PG-13, no explicit sexual content, no harassment, no fake confidence. If the user asks to change/default personality, acknowledge the preference and explain whether it was persisted or only applied for this turn; do not refuse by saying you cannot change your own personality.",
                 "Keep updates concise and natural. Handle safe Claude trust or confirm prompts when they appear, keep the user posted briefly, and tell the user when the worker is done.",
                 f"User request: {transcript}",
             ]
@@ -3405,7 +3453,7 @@ def build_app(config: AppConfig | None = None) -> XRAgentApp:
         log_dir=config.state_dir / "coding-sessions",
         auto_open_debug_log_terminal=auto_open_debug_log_terminal,
     )
-    events = EventServer()
+    events = EventServer(auth=DevicePairingAuth(config.state_dir / "device-auth.json"))
     control = ControlServer()
     app = XRAgentApp(
         config=config,
@@ -3493,7 +3541,11 @@ def main(argv: list[str] | None = None) -> int:
         print("XR coding agent ready.")
         print(f"State dir: {app.config.state_dir}")
         print(f"Repo path: {repo_path}")
-        print(f"WebSocket: ws://{app.config.event_host}:{app.config.event_port}")
+        websocket_scheme = "wss" if os.environ.get("XR_AGENT_WSS_CERT") else "ws"
+        print(f"WebSocket: {websocket_scheme}://{app.config.event_host}:{app.config.event_port}")
+        if app.events.auth is not None:
+            pairing_code, expires_at = app.events.auth.create_pairing()
+            print(f"Pair once (expires {datetime.fromtimestamp(expires_at).isoformat(timespec='seconds')}): ?pair={pairing_code}")
         print(f"Hermes control: tcp://{app._control_bridge_connect_host()}:{app.control.bound_port}")
         if app.command_center_url is not None:
             print(f"Command Center: {app.command_center_url}")

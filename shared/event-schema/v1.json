@@ -28,6 +28,7 @@
         "worker.updated",
         "worker.pending_question",
         "coding_sessions.synced",
+        "auth.paired",
         "voice.realtime.session",
         "voice.realtime.sdp.answer",
         "agent.summary"
@@ -334,7 +335,6 @@
         "request_id": { "type": "string" },
         "ok": { "type": "boolean" },
         "provider": { "type": "string" },
-        "client_secret": { "type": "string" },
         "expires_at": {},
         "model": { "type": "string" },
         "voice": { "type": "string" },
@@ -349,6 +349,7 @@
         "ok": { "type": "boolean" },
         "provider": { "type": "string" },
         "sdp": { "type": "string" },
+        "session": { "type": "object" },
         "error": { "type": "string" }
       }
     }
