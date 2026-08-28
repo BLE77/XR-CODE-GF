@@ -168,8 +168,20 @@ Set `ELEVENLABS_TTS_MODE=timestamps` only when alignment timing matters more tha
 For live voice-to-voice, the Quest client creates a WebRTC offer and the Mac companion completes the OpenAI Realtime SDP exchange server-side. Keep the real API key only on the Mac companion:
 
 - `OPENAI_API_KEY=<your OpenAI API key>`
-- `OPENAI_REALTIME_MODEL=gpt-realtime-1.5`
+- `OPENAI_REALTIME_PROFILE=demo` for lowest-latency demo/video mode, or `operator` for smarter routing with `gpt-realtime-2`
 - `OPENAI_REALTIME_VOICE=marin`
 - `OPENAI_REALTIME_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
 
 The headset never receives the real API key. Tapping the XR mic starts/stops the Realtime session; coding actions are routed back to the local Hermes supervisor with the `route_to_hermes` realtime tool.
+
+## Shared Hermes memory
+
+The Quest app should not own durable memory. It talks to the Mac companion, and the Mac companion routes real work back into your local Hermes install/profile. That keeps the headset voice and regular Hermes CLI aligned on the same memories, preferences, reminders, and personality defaults.
+
+For a terminal Hermes session that also sees the live XR-managed workers, start the Mac companion first, then run from the repo root:
+
+```sh
+./scripts/run-hermes-xr.sh
+```
+
+Plain `hermes` still uses the same Hermes profile/memory, but it only gets the live XR worker/session bridge when launched with the `XR_AGENT_CONTROL_HOST` and `XR_AGENT_CONTROL_PORT` environment variables.

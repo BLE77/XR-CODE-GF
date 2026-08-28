@@ -53,7 +53,21 @@ type AvatarMode = "idle" | "listening" | "thinking" | "speaking";
 type AnimationState = YukiMotionState;
 type AvatarLoadState = "loading" | "ready" | "fallback";
 type XRState = "checking" | "ready" | "entering" | "active" | "unsupported" | "failed";
-type AvatarClipState = "idle" | "listening" | "thinking" | "speaking" | "alert";
+type AvatarClipState =
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "alert"
+  | "walkStart"
+  | "walk"
+  | "walkStop"
+  | "turnLeft"
+  | "turnRight"
+  | "sitDown"
+  | "seatedIdle"
+  | "standUp"
+  | "talkGesture";
 type XrDeckMode = "expanded" | "compact" | "hidden";
 type XrDeckAnchor = "left" | "front" | "right";
 
@@ -213,6 +227,7 @@ type XrUiPlacementState = {
   pendingPanel: XrPanelKey | null;
   pendingPointerKind: XrPanelPointerKind | null;
   pendingClickAction: XrNativeControlAction | null;
+  pendingCanDrag: boolean;
   pendingStartedAt: number;
   pendingStartRayPoint: THREE.Vector3;
   pendingCurrentRayPoint: THREE.Vector3;
@@ -304,6 +319,12 @@ type PreviewLocomotionState = {
   move: THREE.Vector3;
   euler: THREE.Euler;
   quaternion: THREE.Quaternion;
+};
+
+type YukiAnimationTransitionState = {
+  desiredState: AnimationState;
+  transitionState: AnimationState | null;
+  transitionUntil: number;
 };
 
 type IwerVector3Like = {
@@ -507,7 +528,7 @@ const AVATAR_PLACEMENT_MAX_DISTANCE = 3.2;
 const AVATAR_PLACEMENT_RETICLE_LIFT = 0.012;
 const AFFORDANCE_DEBUG_MAX_MARKERS = 10;
 const IWER_SIM_STAGE_DEPTH = -1.92;
-const ACTIVE_XR_STAGE_DEPTH = -1.52;
+const ACTIVE_XR_STAGE_DEPTH = -1.82;
 const STAGE_DEPTH = -1.92;
 const PANEL_DEPTH = -2.18;
 const ASSISTANT_BASE_Y = 0.18;
@@ -517,7 +538,7 @@ const WRIST_MIC_UNAVAILABLE = 0x9aa8bb;
 const WRIST_MIC_RAY_DISTANCE = 2.5;
 const WRIST_MIC_TOUCH_RADIUS = 0.2;
 const XR_UI_DISTANCE = 1.72;
-const XR_UI_MIN_DISTANCE = 0.86;
+const XR_UI_MIN_DISTANCE = 1.05;
 const XR_UI_MAX_DISTANCE = 2.85;
 const XR_UI_HEIGHT_OFFSET = 0.04;
 const XR_UI_MIN_HEIGHT = 1.08;
@@ -525,9 +546,8 @@ const XR_UI_MAX_HEIGHT = 1.62;
 const XR_UI_EXPANDED_SCALE = 1;
 const XR_UI_COMPACT_SCALE = 0.82;
 const XR_UI_HIDDEN_SCALE = 0.72;
-const XR_PANEL_MINIMIZED_SCALE = 0.34;
 const XR_UI_YUKI_SIDE_OFFSET = 0.95;
-const XR_UI_YUKI_BEHIND_OFFSET = 0.62;
+const XR_UI_YUKI_BEHIND_OFFSET = 0.72;
 const XR_UI_YUKI_MIN_HEIGHT_OVER_ROOT = 1.08;
 const XR_UI_SIDE_PANEL_X = 1.18;
 const XR_UI_SIDE_PANEL_Y = -0.42;
@@ -545,10 +565,14 @@ const XR_PANEL_WINDOW_CONTROL_SIZE = 54;
 const XR_PANEL_WINDOW_CONTROL_TOP = 48;
 const XR_PANEL_WINDOW_CONTROL_RIGHT = 52;
 const XR_PANEL_MOVE_BAR_TOP = 48;
-const XR_PANEL_MOVE_BAR_WIDTH = 340;
-const XR_PANEL_MOVE_BAR_HEIGHT = 48;
-const XR_PANEL_EDGE_GRAB_SIZE = 58;
-const XR_PANEL_CORNER_GRAB_SIZE = 96;
+const XR_PANEL_MOVE_BAR_WIDTH = 520;
+const XR_PANEL_MOVE_BAR_HEIGHT = 68;
+const XR_PANEL_EDGE_GRAB_SIZE = 82;
+const XR_PANEL_CORNER_GRAB_SIZE = 132;
+const XR_PANEL_MINIMIZED_DOCK_Y = -0.92;
+const XR_PANEL_MINIMIZED_DOCK_X_STEP = 0.5;
+const XR_PANEL_MINIMIZED_DOCK_Z = 0.1;
+const XR_PANEL_MINIMIZED_DOCK_SCALE = 0.32;
 const XR_PANEL_ORDER: XrPanelKey[] = ["summary", "worker", "status"];
 const XR_STATUS_CONTROL_ZONES: Array<{
   action: XrNativeControlAction;
@@ -598,6 +622,15 @@ const YUKI_PROTOTYPE_ANIMATIONS: Record<AvatarClipState, string> = {
   thinking: "/animations/yuki/prototype/confusion.bvh",
   speaking: "/animations/yuki/prototype/action_attention_seeking.bvh",
   alert: "/animations/yuki/prototype/action_attention_seeking.bvh",
+  walkStart: "/animations/yuki/prototype/walk_start.bvh",
+  walk: "/animations/yuki/prototype/walk_forward.bvh",
+  walkStop: "/animations/yuki/prototype/walk_stop.bvh",
+  turnLeft: "/animations/yuki/prototype/turn_left.bvh",
+  turnRight: "/animations/yuki/prototype/turn_right.bvh",
+  sitDown: "/animations/yuki/prototype/sit_down.bvh",
+  seatedIdle: "/animations/yuki/prototype/seated_idle.bvh",
+  standUp: "/animations/yuki/prototype/stand_up.bvh",
+  talkGesture: "/animations/yuki/prototype/talk_gesture.bvh",
 };
 const YUKI_BVH_BONE_MAP: Record<string, string> = {
   J_Bip_C_Hips: "hips",
@@ -785,6 +818,7 @@ function createXrUiPlacementState(): XrUiPlacementState {
     pendingPanel: null,
     pendingPointerKind: null,
     pendingClickAction: null,
+    pendingCanDrag: false,
     pendingStartedAt: 0,
     pendingStartRayPoint: new THREE.Vector3(),
     pendingCurrentRayPoint: new THREE.Vector3(),
@@ -2552,8 +2586,8 @@ function drawXrPanelMinimizedHud(panel: PanelCard, panelKey: XrPanelKey, selecte
 
   context.fillStyle = "rgba(228, 242, 252, 0.78)";
   context.font = "800 28px Inter, system-ui, sans-serif";
-  context.fillText("Trigger the corner button to restore", 86, height - 138);
-  context.fillText("Grab rail, edge, or corner to move", 86, height - 96);
+  context.fillText("Tap the corner button to restore", 86, height - 138);
+  context.fillText("Hold trigger on rail, edge, or corner to move", 86, height - 96);
 
   drawXrPanelWindowControl(panel, true);
   texture.needsUpdate = true;
@@ -2845,6 +2879,8 @@ function updateXrPanelPointerFeedback(runtime: StageRuntime, activeXrSession: bo
     placement.pendingClickAction ??
     (hoverHit ? xrNativeControlActionAt(hoverHit) : null);
   const hoverZone = placement.dragPanel ? "move-bar" : hoverHit?.zone ?? null;
+  const hoverCanMove = hoverHit ? xrPanelHitCanMovePanel(hoverHit) : false;
+  const hoverClickable = hoverHit ? Boolean(xrNativeControlActionAt(hoverHit)) : false;
 
   placement.hoverPanel = activeXrSession ? hoverPanel : null;
   placement.hoverAction = activeXrSession ? hoverAction : null;
@@ -2855,7 +2891,8 @@ function updateXrPanelPointerFeedback(runtime: StageRuntime, activeXrSession: bo
     const dragging = activeXrSession && placement.dragPanel === key;
     const pressing = activeXrSession && placement.pendingPanel === key;
     const hovering = activeXrSession && hoverPanel === key;
-    panel.mesh.material.color.setHex(dragging ? 0xd9ffef : pressing ? 0xfff2c4 : hovering ? 0xe3f7ff : 0xffffff);
+    const hoverColor = hoverCanMove ? 0xd7ffed : hoverClickable ? 0xdff4ff : 0xeaf7ff;
+    panel.mesh.material.color.setHex(dragging ? 0xc8ffe8 : pressing ? 0xfff0bd : hovering ? hoverColor : 0xffffff);
     panel.mesh.material.opacity = 1;
   }
 }
@@ -2902,15 +2939,16 @@ function updateXrInputDiagnostics(runtime: StageRuntime, activeXrSession: boolea
   if (placement.dragSource && placement.dragPanel) {
     setXrInputDiagnostic(
       runtime.xrDiagnostics,
-      `Grab moving ${xrPanelFocusLabel(placement.dragPanel)}. Release grab to place it.`,
+      `Moving ${xrPanelFocusLabel(placement.dragPanel)}. Release to place it.`,
       "active",
     );
     return;
   }
   if (placement.pendingSource && placement.pendingPanel) {
+    const dragHint = placement.pendingCanDrag ? " Hold to move; release quickly to leave it." : " Release to click.";
     setXrInputDiagnostic(
       runtime.xrDiagnostics,
-      `Trigger on ${xrPanelFocusLabel(placement.pendingPanel)}. Release to click. Rail, edge, or corner grab moves panels.`,
+      `Trigger on ${xrPanelFocusLabel(placement.pendingPanel)}.${dragHint}`,
       "active",
     );
     return;
@@ -2923,8 +2961,8 @@ function updateXrInputDiagnostics(runtime: StageRuntime, activeXrSession: boolea
     const action = placement.hoverAction ? ` ${xrNativeControlDiagnosticLabel(placement.hoverAction)}.` : "";
     const moveHint =
       placement.hoverZone === "move-bar" || placement.hoverZone === "edge" || placement.hoverZone === "corner"
-        ? " Grab moves this panel."
-        : " Trigger clicks; grab rail, edge, or corner to move.";
+        ? " Hold trigger or grip to move this panel."
+        : " Trigger clicks; rail, edge, or corner moves panels.";
     setXrInputDiagnostic(
       runtime.xrDiagnostics,
       `Hovering ${xrPanelFocusLabel(placement.hoverPanel)}.${action}${moveHint}`,
@@ -3010,6 +3048,7 @@ function clearXrUiPendingPress(placement: XrUiPlacementState) {
   placement.pendingPanel = null;
   placement.pendingPointerKind = null;
   placement.pendingClickAction = null;
+  placement.pendingCanDrag = false;
   placement.pendingStartedAt = 0;
   placement.pendingRayDistance = XR_UI_DISTANCE;
 }
@@ -3083,9 +3122,12 @@ function startXrUiDeckPress(
   placement.pendingPanel = panel;
   placement.pendingPointerKind = options.pointerKind ?? "select";
   placement.pendingClickAction = options.clickAction ?? null;
+  placement.pendingCanDrag = xrPanelHitCanMovePanel(options.hit ?? null);
   placement.pendingStartedAt = performance.now();
   placement.lastPointerEventAt = placement.pendingStartedAt;
-  placement.lastPointerEventLabel = `Pressed ${panel}`;
+  placement.lastPointerEventLabel = placement.pendingCanDrag
+    ? `Holding ${panel} move target`
+    : `Pressed ${panel}`;
 }
 
 function startXrUiDeckDrag(
@@ -3102,16 +3144,13 @@ function startXrUiDeckDrag(
   } = {},
 ): boolean {
   const pointerKind = options.pointerKind ?? "squeeze";
-  if (pointerKind !== "squeeze") {
-    return false;
-  }
   const placement = runtime.xrUi;
   if (options.hit && !xrPanelHitCanMovePanel(options.hit)) {
     placement.lastPointerEventAt = performance.now();
     placement.lastPointerEventLabel =
       options.hit.zone === "window-control"
-        ? "Window control is trigger-only"
-        : `Grab the ${xrPanelFocusLabel(options.hit.key)} rail, edge, or corner to move it`;
+        ? "Window control is tap-only"
+        : `Hold trigger or grip on the ${xrPanelFocusLabel(options.hit.key)} rail, edge, or corner`;
     return false;
   }
   clearXrUiPendingPress(placement);
@@ -3153,7 +3192,8 @@ function startXrUiDeckDrag(
   placement.dragStartedAt = options.startedAt ?? performance.now();
   placement.dragMoved = false;
   placement.lastPointerEventAt = performance.now();
-  placement.lastPointerEventLabel = `Dragging ${panel}`;
+  placement.lastPointerEventLabel =
+    pointerKind === "select" ? `Trigger moving ${panel}` : pointerKind === "pinch" ? `Pinch moving ${panel}` : `Grab moving ${panel}`;
   placement.manualPlacement = true;
   rememberXrPanelManualTransform(runtime, panel);
   placement.recenterRequested = false;
@@ -3168,7 +3208,7 @@ function promoteXrUiPendingPressToDrag(runtime: StageRuntime, reason: "hold" | "
   const source = placement.pendingSource;
   const panel = placement.pendingPanel;
   const pointerKind = placement.pendingPointerKind ?? "select";
-  if (pointerKind !== "squeeze") {
+  if (!placement.pendingCanDrag) {
     return false;
   }
   const clickAction = placement.pendingClickAction;
@@ -3195,7 +3235,7 @@ function updateXrUiPendingPress(runtime: StageRuntime) {
   if (!source) {
     return false;
   }
-  if (placement.pendingPointerKind !== "squeeze") {
+  if (!placement.pendingCanDrag) {
     return false;
   }
 
@@ -3234,13 +3274,15 @@ function endXrUiDeckPress(
     .addScaledVector(placement.sourceDirection, placement.pendingRayDistance);
   const panel = placement.pendingPanel;
   const clickAction = placement.pendingClickAction;
+  const pendingCanDrag = placement.pendingCanDrag;
   const heldMs = performance.now() - placement.pendingStartedAt;
   const movedDistance = placement.pendingCurrentRayPoint.distanceTo(placement.pendingStartRayPoint);
   const shouldClick =
-    placement.pendingPointerKind === "select" ||
-    (heldMs < XR_UI_PINCH_HOLD_DRAG_MS && movedDistance < XR_UI_PINCH_DRAG_RAY_THRESHOLD);
+    (!pendingCanDrag && placement.pendingPointerKind === "select") ||
+    Boolean(clickAction) ||
+    (!pendingCanDrag && heldMs < XR_UI_PINCH_HOLD_DRAG_MS && movedDistance < XR_UI_PINCH_DRAG_RAY_THRESHOLD);
   placement.lastPointerEventAt = performance.now();
-  placement.lastPointerEventLabel = shouldClick && panel ? `Tapped ${panel}` : "Released trigger";
+  placement.lastPointerEventLabel = shouldClick && panel ? `Tapped ${panel}` : `Released ${panel ?? "panel"}`;
   clearXrUiPendingPress(placement);
   return { panel, clickAction, shouldClick };
 }
@@ -3889,11 +3931,25 @@ function mapClipState(state: AnimationState): AvatarClipState {
     case "thinking":
       return "thinking";
     case "speaking":
-      return "speaking";
+      return "talkGesture";
     case "alert":
       return "alert";
+    case "walkStart":
+      return "walkStart";
+    case "walking":
+      return "walk";
+    case "walkStop":
+      return "walkStop";
+    case "turnLeft":
+      return "turnLeft";
+    case "turnRight":
+      return "turnRight";
+    case "sitDown":
+      return "sitDown";
     case "sitting":
-      return "idle";
+      return "seatedIdle";
+    case "standUp":
+      return "standUp";
     default:
       return "idle";
   }
@@ -5424,18 +5480,48 @@ function applyXrPanelLayoutPose(
   position: readonly [number, number, number],
   scale: number,
   rotation: readonly [number, number, number],
+  options: { ignoreManual?: boolean } = {},
 ) {
   const placement = runtime.xrUi;
   const panelMesh = runtime.panels[panel].mesh;
   panelMesh.visible = visible;
   panelMesh.scale.setScalar(scale);
-  if (placement.panelManualPlacement[panel]) {
+  if (!options.ignoreManual && placement.panelManualPlacement[panel]) {
     panelMesh.position.copy(placement.panelManualPositions[panel]);
     panelMesh.quaternion.copy(placement.panelManualQuaternions[panel]);
     return;
   }
   panelMesh.position.set(...position);
   panelMesh.rotation.set(...rotation);
+}
+
+function xrPanelMinimizedDockPosition(panel: XrPanelKey): [number, number, number] {
+  const index = XR_PANEL_ORDER.indexOf(panel);
+  return [(index - 1) * XR_PANEL_MINIMIZED_DOCK_X_STEP, XR_PANEL_MINIMIZED_DOCK_Y, XR_PANEL_MINIMIZED_DOCK_Z];
+}
+
+function applyXrPanelDisplayPose(
+  runtime: StageRuntime,
+  panel: XrPanelKey,
+  displayMode: XrPanelDisplayMode,
+  visible: boolean,
+  position: readonly [number, number, number],
+  scale: number,
+  rotation: readonly [number, number, number],
+) {
+  if (displayMode === "minimized") {
+    applyXrPanelLayoutPose(
+      runtime,
+      panel,
+      true,
+      xrPanelMinimizedDockPosition(panel),
+      XR_PANEL_MINIMIZED_DOCK_SCALE,
+      [0, 0, 0],
+      { ignoreManual: runtime.xrUi.dragPanel !== panel },
+    );
+    return;
+  }
+  applyXrPanelLayoutPose(runtime, panel, visible, position, scale, rotation);
 }
 
 function updateXrUiPlacement(
@@ -5488,37 +5574,34 @@ function updateXrUiPlacement(
         ? XR_UI_COMPACT_SCALE
         : XR_UI_HIDDEN_SCALE,
   );
-  const panelScale = (panel: XrPanelKey, baseScale: number) =>
-    panelDisplay[panel] === "minimized" ? baseScale * XR_PANEL_MINIMIZED_SCALE : baseScale;
-
   if (deckMode === "hidden") {
-    applyXrPanelLayoutPose(runtime, "summary", false, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], panelScale("summary", 0.72), [
+    applyXrPanelDisplayPose(runtime, "summary", panelDisplay.summary, false, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], 0.72, [
       0,
       0.1,
       0,
     ]);
-    applyXrPanelLayoutPose(runtime, "worker", false, [0, XR_UI_CENTER_PANEL_Y, 0], panelScale("worker", 1.02), [0, 0, 0]);
-    applyXrPanelLayoutPose(runtime, "status", true, [0, XR_UI_STATUS_Y + 0.04, 0.04], panelScale("status", 0.72), [0, 0, 0]);
+    applyXrPanelDisplayPose(runtime, "worker", panelDisplay.worker, false, [0, XR_UI_CENTER_PANEL_Y, 0], 1.02, [0, 0, 0]);
+    applyXrPanelDisplayPose(runtime, "status", panelDisplay.status, true, [0, XR_UI_STATUS_Y + 0.04, 0.04], 0.72, [0, 0, 0]);
     return;
   }
   if (deckMode === "compact") {
-    applyXrPanelLayoutPose(runtime, "summary", false, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], panelScale("summary", 0.72), [
+    applyXrPanelDisplayPose(runtime, "summary", panelDisplay.summary, false, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], 0.72, [
       0,
       0.1,
       0,
     ]);
-    applyXrPanelLayoutPose(runtime, "worker", true, [0, XR_UI_CENTER_PANEL_Y + 0.02, 0], panelScale("worker", 0.92), [0, 0, 0]);
-    applyXrPanelLayoutPose(runtime, "status", true, [0, XR_UI_STATUS_Y + 0.08, 0.04], panelScale("status", 0.78), [0, 0, 0]);
+    applyXrPanelDisplayPose(runtime, "worker", panelDisplay.worker, true, [0, XR_UI_CENTER_PANEL_Y + 0.02, 0], 0.92, [0, 0, 0]);
+    applyXrPanelDisplayPose(runtime, "status", panelDisplay.status, true, [0, XR_UI_STATUS_Y + 0.08, 0.04], 0.78, [0, 0, 0]);
     return;
   }
 
-  applyXrPanelLayoutPose(runtime, "summary", true, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], panelScale("summary", 0.72), [
+  applyXrPanelDisplayPose(runtime, "summary", panelDisplay.summary, true, [-XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], 0.72, [
     0,
     0.1,
     0,
   ]);
-  applyXrPanelLayoutPose(runtime, "worker", true, [0, XR_UI_CENTER_PANEL_Y, 0], panelScale("worker", 1.02), [0, 0, 0]);
-  applyXrPanelLayoutPose(runtime, "status", true, [XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], panelScale("status", 0.72), [
+  applyXrPanelDisplayPose(runtime, "worker", panelDisplay.worker, true, [0, XR_UI_CENTER_PANEL_Y, 0], 1.02, [0, 0, 0]);
+  applyXrPanelDisplayPose(runtime, "status", panelDisplay.status, true, [XR_UI_SIDE_PANEL_X, XR_UI_SIDE_PANEL_Y, 0.02], 0.72, [
     0,
     -0.1,
     0,
@@ -5563,10 +5646,51 @@ function deriveAnimationState(
   return "idle";
 }
 
+function resolveYukiAnimationTransition(
+  transition: YukiAnimationTransitionState,
+  desiredState: AnimationState,
+  elapsed: number,
+): AnimationState {
+  if (desiredState !== transition.desiredState) {
+    const previousState = transition.desiredState;
+    transition.desiredState = desiredState;
+    if (previousState !== "sitting" && desiredState === "sitting") {
+      transition.transitionState = "sitDown";
+      transition.transitionUntil = elapsed + 1.12;
+    } else if (previousState === "sitting" && desiredState !== "sitting") {
+      transition.transitionState = "standUp";
+      transition.transitionUntil = elapsed + 0.98;
+    } else {
+      transition.transitionState = null;
+      transition.transitionUntil = elapsed;
+    }
+  }
+
+  if (transition.transitionState && elapsed < transition.transitionUntil) {
+    return transition.transitionState;
+  }
+
+  transition.transitionState = null;
+  return desiredState;
+}
+
 function animationFeedback(state: AnimationState): string {
   switch (state) {
     case "speaking":
       return "Yuki is actively voicing Hermes back to you.";
+    case "walkStart":
+      return "Yuki is stepping into motion.";
+    case "walking":
+      return "Yuki is walking to the target.";
+    case "walkStop":
+      return "Yuki is settling back into a planted stance.";
+    case "turnLeft":
+    case "turnRight":
+      return "Yuki is turning in place.";
+    case "sitDown":
+      return "Yuki is sitting down.";
+    case "standUp":
+      return "Yuki is standing up.";
     case "thinking":
       return "Yuki is in the thinking hold while Hermes plans the next move.";
     case "listening":
@@ -5778,6 +5902,11 @@ export function ImmersiveHermesStage({
   const signalEventsRef = useRef(signalEvents);
   const activityEventsRef = useRef(activityEvents);
   const seenSpatialObjectEventsRef = useRef<Set<string>>(new Set());
+  const yukiAnimationTransitionRef = useRef<YukiAnimationTransitionState>({
+    desiredState: "idle",
+    transitionState: null,
+    transitionUntil: 0,
+  });
   const micAvailableRef = useRef(micAvailable);
   const micActiveRef = useRef(micActive);
   const onToggleMicRef = useRef(onToggleMic);
@@ -6211,8 +6340,8 @@ export function ImmersiveHermesStage({
           runtime.xrUi.lastPointerEventAt = performance.now();
           runtime.xrUi.lastPointerEventLabel =
             panelDetail.zone === "window-control"
-              ? "Use trigger on the window button"
-              : `Grab the ${xrPanelFocusLabel(panelHit)} rail, edge, or corner to move it`;
+              ? "Tap the window button"
+              : `Hold trigger or grip on the ${xrPanelFocusLabel(panelHit)} rail, edge, or corner`;
         }
       } else {
         if (action === "toggle-mic") {
@@ -7014,8 +7143,8 @@ export function ImmersiveHermesStage({
                   liveRuntime.xrUi.lastPointerEventAt = performance.now();
                   liveRuntime.xrUi.lastPointerEventLabel =
                     panelDetail.zone === "window-control"
-                      ? "Use trigger on the window button"
-                      : `Grab the ${xrPanelFocusLabel(panelHit)} rail, edge, or corner to move it`;
+                      ? "Tap the window button"
+                      : `Hold trigger or grip on the ${xrPanelFocusLabel(panelHit)} rail, edge, or corner`;
                 }
                 return;
               }
@@ -7245,7 +7374,11 @@ export function ImmersiveHermesStage({
             affordance: behaviorPlan.action.affordance,
           });
         }
-        const animationState = behaviorPlan.animationState;
+        const animationState = resolveYukiAnimationTransition(
+          yukiAnimationTransitionRef.current,
+          behaviorPlan.animationState,
+          elapsed,
+        );
         if (mountedRef.current && elapsed - spatialScanDebugAtRef.current > 0.35) {
           spatialScanDebugAtRef.current = elapsed;
           setSpatialScanDebug(spatialScanSummary(live));
@@ -7430,7 +7563,12 @@ export function ImmersiveHermesStage({
           applyAvatarRigPose(live.avatarRig, animationState, elapsed, speechSpeakingRef.current);
         }
 
-        if (live.avatarRig && animationState === "sitting" && !live.fallbackRig.group.visible) {
+        if (
+          live.avatarRig &&
+          animationState === "sitting" &&
+          !live.avatarAnimations &&
+          !live.fallbackRig.group.visible
+        ) {
           applyAvatarSeatedPose(live.avatarRig, elapsed, speechSpeakingRef.current);
         }
 

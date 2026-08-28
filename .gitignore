@@ -22,6 +22,9 @@ apps/mac-companion/.env.local
 # Local Quest browser/dev artifacts
 apps/metaquest-client/.certs/
 apps/metaquest-client/.smoke-preview/
+apps/metaquest-client/.animation-sources/
+apps/mobile-yuki/ios/XRCodingAgentMobileIOS/*.xcodeproj/
+apps/mobile-yuki/ios/Frameworks/**/*.dSYM/
 .server-logs/
 .codex-cron/
 mac-command-center-hermes-os*.png

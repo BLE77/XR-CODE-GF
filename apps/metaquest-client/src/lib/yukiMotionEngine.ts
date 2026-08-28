@@ -1,6 +1,20 @@
 import * as THREE from "three";
 
-export type YukiMotionState = "idle" | "listening" | "thinking" | "speaking" | "alert" | "ready" | "sitting";
+export type YukiMotionState =
+  | "idle"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "alert"
+  | "ready"
+  | "walkStart"
+  | "walking"
+  | "walkStop"
+  | "turnLeft"
+  | "turnRight"
+  | "sitDown"
+  | "sitting"
+  | "standUp";
 
 export type YukiMotionIntent = {
   state: YukiMotionState;
@@ -47,7 +61,14 @@ const MOTION_STATES: YukiMotionState[] = [
   "speaking",
   "alert",
   "ready",
+  "walkStart",
+  "walking",
+  "walkStop",
+  "turnLeft",
+  "turnRight",
+  "sitDown",
   "sitting",
+  "standUp",
 ];
 
 const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
@@ -135,6 +156,90 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     floorResponse: 12,
     plantBias: 0.9,
   },
+  walkStart: {
+    energy: 0.58,
+    attentiveness: 0.64,
+    forwardLean: -0.032,
+    sideSway: 0.024,
+    verticalLift: 0.018,
+    pulseSpeed: 1.5,
+    strideSpeed: 0.78,
+    clipTimeScale: 0.96,
+    clipCrossFadeSeconds: 0.18,
+    floorClearance: 0.024,
+    floorResponse: 18,
+    plantBias: 0.64,
+  },
+  walking: {
+    energy: 0.68,
+    attentiveness: 0.58,
+    forwardLean: -0.038,
+    sideSway: 0.03,
+    verticalLift: 0.024,
+    pulseSpeed: 1.9,
+    strideSpeed: 1.05,
+    clipTimeScale: 1,
+    clipCrossFadeSeconds: 0.14,
+    floorClearance: 0.028,
+    floorResponse: 18,
+    plantBias: 0.58,
+  },
+  walkStop: {
+    energy: 0.42,
+    attentiveness: 0.68,
+    forwardLean: -0.018,
+    sideSway: 0.018,
+    verticalLift: 0.014,
+    pulseSpeed: 1.25,
+    strideSpeed: 0.55,
+    clipTimeScale: 0.88,
+    clipCrossFadeSeconds: 0.18,
+    floorClearance: 0.02,
+    floorResponse: 20,
+    plantBias: 0.72,
+  },
+  turnLeft: {
+    energy: 0.5,
+    attentiveness: 0.76,
+    forwardLean: -0.016,
+    sideSway: 0.02,
+    verticalLift: 0.016,
+    pulseSpeed: 1.45,
+    strideSpeed: 0.72,
+    clipTimeScale: 0.94,
+    clipCrossFadeSeconds: 0.18,
+    floorClearance: 0.02,
+    floorResponse: 20,
+    plantBias: 0.78,
+  },
+  turnRight: {
+    energy: 0.5,
+    attentiveness: 0.76,
+    forwardLean: -0.016,
+    sideSway: -0.02,
+    verticalLift: 0.016,
+    pulseSpeed: 1.45,
+    strideSpeed: 0.72,
+    clipTimeScale: 0.94,
+    clipCrossFadeSeconds: 0.18,
+    floorClearance: 0.02,
+    floorResponse: 20,
+    plantBias: 0.78,
+  },
+  sitDown: {
+    energy: 0.2,
+    attentiveness: 0.62,
+    forwardLean: -0.018,
+    sideSway: 0.004,
+    verticalLift: 0.002,
+    pulseSpeed: 0.52,
+    strideSpeed: 0.08,
+    clipTimeScale: 0.82,
+    clipCrossFadeSeconds: 0.16,
+    floorClearance: 0.012,
+    floorResponse: 24,
+    plantBias: 0.98,
+  },
   sitting: {
     energy: 0.16,
     attentiveness: 0.54,
@@ -148,6 +253,20 @@ const MOTION_PROFILES: Record<YukiMotionState, MotionProfile> = {
     floorClearance: 0.018,
     floorResponse: 14,
     plantBias: 1,
+  },
+  standUp: {
+    energy: 0.3,
+    attentiveness: 0.72,
+    forwardLean: -0.012,
+    sideSway: 0.006,
+    verticalLift: 0.004,
+    pulseSpeed: 0.72,
+    strideSpeed: 0.1,
+    clipTimeScale: 0.9,
+    clipCrossFadeSeconds: 0.18,
+    floorClearance: 0.014,
+    floorResponse: 24,
+    plantBias: 0.96,
   },
 };
 
@@ -216,7 +335,14 @@ export class YukiMotionEngine {
     speaking: 0,
     alert: 0,
     ready: 0,
+    walkStart: 0,
+    walking: 0,
+    walkStop: 0,
+    turnLeft: 0,
+    turnRight: 0,
+    sitDown: 0,
     sitting: 0,
+    standUp: 0,
   };
 
   private readonly rootOffset = new THREE.Vector3();
@@ -279,7 +405,11 @@ export class YukiMotionEngine {
 
     const profile = profileBlend(this.weights);
     const isActualXr = actualXrSession(intent);
-    const sittingWeight = this.weights.sitting;
+    const sittingWeight = THREE.MathUtils.clamp(
+      this.weights.sitting + this.weights.sitDown + this.weights.standUp * 0.72,
+      0,
+      1,
+    );
     const speechBoost = intent.speechSpeaking ? 0.12 : 0;
     const xrDamp = isActualXr ? 0.68 : 1;
     const plantedVerticalDamp = isActualXr ? THREE.MathUtils.lerp(0.12, 0.015, sittingWeight) : 1;
