@@ -8,7 +8,8 @@ configs:
 settings:
   base:
     PRODUCT_NAME: MobileYukiIOS
-    PRODUCT_BUNDLE_IDENTIFIER: com.nousresearch.mobileyuki.ios
+    PRODUCT_BUNDLE_IDENTIFIER: com.supafan77.mobileyuki.ios
+    DEVELOPMENT_TEAM: QFZ2R7SK6V
     SWIFT_VERSION: 5.0
     CODE_SIGN_STYLE: Automatic
     GENERATE_INFOPLIST_FILE: NO
@@ -23,6 +24,9 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: ../App
+    dependencies:
+      - framework: ../Frameworks/GLTFKit2.xcframework
+        embed: true
     settings:
       base:
         PRODUCT_MODULE_NAME: MobileYukiIOS

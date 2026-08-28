@@ -24,6 +24,7 @@
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>yukimobile</string>
+				<string>yuki</string>
 			</array>
 		</dict>
 	</array>
@@ -49,6 +50,10 @@
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arkit</string>
+	</array>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
 	</array>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+  <meta name="theme-color" content="#070912">
+  <title>Mobile Yuki</title>
+  <link rel="stylesheet" href="./styles.css?v=20260827-4">
+  <script type="importmap">
+    {"imports":{"three":"./vendor/three.module.min.js","three/addons/":"./vendor/"}}
+  </script>
+</head>
+<body>
+  <video id="camera" playsinline muted></video>
+  <div id="scene" aria-label="Interactive Yuki 3D view"></div>
+  <div class="aurora"></div>
+
+  <header>
+    <div class="brand"><span class="pulse"></span><span>MOBILE YUKI</span></div>
+    <div id="connection" class="chip">TAILNET PRIVATE</div>
+  </header>
+
+  <main>
+    <section class="intro">
+      <p class="eyebrow">HERMES XR BODY</p>
+      <h1>Yuki is<br><em>right here.</em></h1>
+      <p id="status">Loading her 3D body…</p>
+    </section>
+  </main>
+
+  <section class="controls" aria-label="Yuki controls">
+    <button id="liveArButton" class="action primary">
+      <span class="icon">◉</span>
+      <span><b>Start Camera Overlay</b><small>Animated Yuki over your live camera</small></span>
+    </button>
+    <button id="motionButton" class="action">
+      <span class="icon">✦</span>
+      <span><b>Show Listening Motion</b><small>Idle · listen · think · speak</small></span>
+    </button>
+    <a class="action" href="https://supas-mac-mini.tail589137.ts.net:9443/">
+      <span class="icon">⌁</span>
+      <span><b>Talk to Hermy</b><small>Open the private live voice line</small></span>
+    </a>
+  </section>
+
+  <div class="hint">Drag to turn Yuki · Pinch to resize</div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="./app.js?v=20260827-4"></script>
+</body>
+</html>

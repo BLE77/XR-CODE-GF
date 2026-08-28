@@ -26,7 +26,22 @@ final class YukiIOSClient: ObservableObject {
             UserDefaults.standard.set(agentName, forKey: Self.agentDefaultsKey)
         }
     }
+    @Published var eventScheme: String {
+        didSet { UserDefaults.standard.set(eventScheme, forKey: Self.eventSchemeDefaultsKey) }
+    }
+    @Published var realtimePort: String {
+        didSet { UserDefaults.standard.set(realtimePort, forKey: Self.realtimePortDefaultsKey) }
+    }
+    @Published var realtimeToken: String {
+        didSet { YukiSecureStore.set(realtimeToken, account: Self.realtimeTokenAccount) }
+    }
+    @Published var realtimeScheme: String {
+        didSet { UserDefaults.standard.set(realtimeScheme, forKey: Self.realtimeSchemeDefaultsKey) }
+    }
     @Published private(set) var isConnected = false
+    @Published private(set) var isRealtimeConnected = false
+    @Published private(set) var isMicrophoneMuted: Bool
+    @Published private(set) var realtimeStatus = "Live voice not connected"
     @Published private(set) var statusText = "Disconnected"
     @Published private(set) var avatarPhase: YukiAvatarPhase = .idle
     @Published private(set) var latestReply: String?
@@ -36,16 +51,36 @@ final class YukiIOSClient: ObservableObject {
     private static let hostDefaultsKey = "xr.ios.mac_companion_host"
     private static let portDefaultsKey = "xr.ios.mac_companion_port"
     private static let agentDefaultsKey = "xr.ios.agent_name"
+    private static let eventSchemeDefaultsKey = "xr.ios.event_scheme"
+    private static let realtimePortDefaultsKey = "xr.ios.realtime_port"
+    private static let realtimeTokenAccount = "mobile-yuki-realtime-token"
+    private static let realtimeSchemeDefaultsKey = "xr.ios.realtime_scheme"
+    private static let microphoneMutedDefaultsKey = "xr.ios.microphone_muted"
 
     private var socketTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var avatarResetTask: Task<Void, Never>?
     private let decoder = JSONDecoder()
+    private lazy var realtimeAudio: YukiRealtimeAudioController = {
+        let controller = YukiRealtimeAudioController()
+        controller.onState = { [weak self] state, detail in
+            self?.ingestRealtimeState(state, detail: detail)
+        }
+        controller.onTranscript = { [weak self] text, isFinal, isUser in
+            self?.ingestRealtimeTranscript(text, isFinal: isFinal, isUser: isUser)
+        }
+        return controller
+    }()
 
     init() {
         self.host = UserDefaults.standard.string(forKey: Self.hostDefaultsKey) ?? "127.0.0.1"
         self.port = UserDefaults.standard.string(forKey: Self.portDefaultsKey) ?? "8765"
         self.agentName = UserDefaults.standard.string(forKey: Self.agentDefaultsKey) ?? "yuki"
+        self.eventScheme = UserDefaults.standard.string(forKey: Self.eventSchemeDefaultsKey) ?? "ws"
+        self.realtimePort = UserDefaults.standard.string(forKey: Self.realtimePortDefaultsKey) ?? "8789"
+        self.realtimeToken = YukiSecureStore.load(account: Self.realtimeTokenAccount) ?? ""
+        self.realtimeScheme = UserDefaults.standard.string(forKey: Self.realtimeSchemeDefaultsKey) ?? "ws"
+        self.isMicrophoneMuted = UserDefaults.standard.bool(forKey: Self.microphoneMutedDefaultsKey)
     }
 
     func connect() {
@@ -57,7 +92,8 @@ final class YukiIOSClient: ObservableObject {
             statusText = "Enter a Mac host and port"
             return
         }
-        guard let url = URL(string: "ws://\(trimmedHost):\(portNumber)") else {
+        let socketScheme = eventScheme == "wss" ? "wss" : "ws"
+        guard let url = URL(string: "\(socketScheme)://\(trimmedHost):\(portNumber)") else {
             statusText = "Invalid websocket URL"
             return
         }
@@ -93,11 +129,11 @@ final class YukiIOSClient: ObservableObject {
 
     @discardableResult
     func applyDeepLink(_ url: URL) -> Bool {
-        guard url.scheme?.lowercased() == "yukimobile" else {
+        guard ["yukimobile", "yuki"].contains(url.scheme?.lowercased() ?? "") else {
             statusText = "Unsupported Mobile Yuki link"
             return false
         }
-        guard url.host?.lowercased() == "connect" else {
+        guard ["connect", "c"].contains(url.host?.lowercased() ?? "") else {
             statusText = "Unsupported Mobile Yuki action"
             return false
         }
@@ -110,35 +146,85 @@ final class YukiIOSClient: ObservableObject {
             }
         }
 
-        let platform = params["platform"]?.lowercased() ?? "auto"
+        let platform = (params["platform"] ?? params["pf"])?.lowercased() ?? "auto"
         guard platform == "auto" || platform == "ios" else {
             statusText = "This Mobile Yuki QR is for \(platform)"
             return false
         }
-        guard (params["scheme"] ?? "ws").lowercased() == "ws" else {
-            statusText = "Only ws Mobile Yuki links are supported"
+        let nextEventScheme = (params["scheme"] ?? params["s"] ?? "ws").lowercased()
+        guard nextEventScheme == "ws" || nextEventScheme == "wss" else {
+            statusText = "Only ws/wss Mobile Yuki links are supported"
             return false
         }
-        guard let nextHost = params["host"]?.trimmingCharacters(in: .whitespacesAndNewlines), !nextHost.isEmpty else {
+        guard let nextHost = (params["host"] ?? params["h"])?.trimmingCharacters(in: .whitespacesAndNewlines), !nextHost.isEmpty else {
             statusText = "Mobile Yuki link is missing host"
             return false
         }
 
-        let nextPort = params["port"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "8765"
+        let nextPort = (params["port"] ?? params["p"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "8765"
         host = nextHost
         port = nextPort.isEmpty ? "8765" : nextPort
-        if let nextAgent = params["agent"]?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAgent.isEmpty {
+        eventScheme = nextEventScheme
+        realtimePort = (params["realtimePort"] ?? params["rp"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? realtimePort
+        realtimeToken = (params["realtimeToken"] ?? params["t"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? realtimeToken
+        realtimeScheme = (params["realtimeScheme"] ?? params["rs"] ?? nextEventScheme).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let nextAgent = (params["agent"] ?? params["a"])?.trimmingCharacters(in: .whitespacesAndNewlines), !nextAgent.isEmpty {
             agentName = nextAgent
         }
         statusText = "Opening Mobile Yuki link"
-        connect()
+        if realtimeToken.isEmpty {
+            connect()
+        } else {
+            statusText = "Secure Realtime session"
+        }
+        connectRealtimeIfConfigured()
         return true
+    }
+
+    func toggleRealtime() {
+        if isRealtimeConnected {
+            realtimeAudio.disconnect()
+        } else {
+            connectRealtimeIfConfigured()
+        }
+    }
+
+    func connectRealtimeIfConfigured() {
+        guard let portNumber = Int(realtimePort), !realtimeToken.isEmpty else {
+            realtimeStatus = "Scan an authenticated Mobile Yuki QR first"
+            return
+        }
+        realtimeAudio.setMicrophoneMuted(isMicrophoneMuted)
+        realtimeAudio.connect(
+            host: host.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: portNumber,
+            scheme: realtimeScheme,
+            token: realtimeToken
+        )
+    }
+
+    func toggleMicrophoneMute() {
+        isMicrophoneMuted.toggle()
+        UserDefaults.standard.set(isMicrophoneMuted, forKey: Self.microphoneMutedDefaultsKey)
+        realtimeAudio.setMicrophoneMuted(isMicrophoneMuted)
+        realtimeStatus = isMicrophoneMuted ? "Microphone muted" : "Microphone on"
+    }
+
+    func cancelRealtimeReply() {
+        realtimeAudio.cancelResponse()
     }
 
     func sendTextCommand(_ text: String, repoPath: String? = nil) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return false
+        }
+
+        if isRealtimeConnected, realtimeAudio.sendTextCommand(trimmed) {
+            avatarPhase = .thinking
+            latestTranscript = trimmed
+            statusText = "Queued through secure Realtime"
+            return true
         }
 
         var payload: [String: Any] = ["text": trimmed]
@@ -240,6 +326,53 @@ final class YukiIOSClient: ObservableObject {
         try await socketTask.send(.string(string))
         if updateStatus {
             statusText = "Sent to Hermes"
+        }
+    }
+
+    private func ingestRealtimeState(_ state: YukiRealtimeAudioController.State, detail: String?) {
+        realtimeStatus = detail ?? {
+            switch state {
+            case .disconnected: return "Live voice disconnected"
+            case .connecting: return "Connecting live voice"
+            case .authenticated: return "Live voice authenticated"
+            case .ready: return "Mobile Yuki is live"
+            case .listening: return "Listening"
+            case .speaking: return "Speaking"
+            case .reconnecting: return "Reconnecting live voice"
+            case .failed: return "Live voice failed"
+            }
+        }()
+        switch state {
+        case .authenticated, .ready, .listening, .speaking:
+            isRealtimeConnected = true
+        case .disconnected, .failed:
+            isRealtimeConnected = false
+        case .connecting, .reconnecting:
+            break
+        }
+        switch state {
+        case .listening:
+            avatarPhase = .listening
+        case .speaking:
+            avatarPhase = .speaking
+        case .ready, .authenticated:
+            avatarPhase = .ready
+        case .failed:
+            avatarPhase = .alert
+        default:
+            break
+        }
+    }
+
+    private func ingestRealtimeTranscript(_ text: String, isFinal: Bool, isUser: Bool) {
+        if isUser {
+            latestTranscript = text
+            return
+        }
+        if isFinal {
+            latestReply = text
+        } else {
+            latestReply = (latestReply ?? "") + text
         }
     }
 

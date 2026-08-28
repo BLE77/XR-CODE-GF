@@ -60,6 +60,7 @@ Rationale:
 Initial iOS modules:
 
 - `YukiIOSClient`: websocket client using `AgentWireEvent`, `voice.command`, and later `voice.audio`.
+- `YukiRealtimeAudioController`: continuous AVAudioEngine capture/playback over the authenticated Mac Realtime relay.
 - `YukiARView`: `ARView(cameraMode: .ar)`, ARKit world tracking, plane raycast placement, fallback placement in front of the camera.
 - `YukiARSceneModel`: placement state and app-to-AR requests.
 - `YukiARContentView`: direct app surface over the AR view.
@@ -214,5 +215,5 @@ Android checks when scaffolded:
 - No Android module is implemented yet; only the track boundary is documented.
 - No final mobile Yuki asset package is selected for iOS or Android.
 - Android deep-link parsing is not implemented yet.
-- The Mac companion websocket is unauthenticated LAN transport.
+- The legacy Mac companion event websocket is still unauthenticated LAN transport; live Realtime audio is separately token-authenticated and can bind to Tailscale.
 - Real room item awareness still needs mobile spatial observation events and companion consumers.
